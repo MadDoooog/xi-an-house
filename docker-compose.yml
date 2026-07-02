@@ -1,0 +1,49 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: xian
+      POSTGRES_PASSWORD: xian
+      POSTGRES_DB: xian_house
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xian -d xian_house"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ./backend
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://xian:xian@db:5432/xian_house
+      CRAWL_DELAY_SECONDS: ${CRAWL_DELAY_SECONDS:-3}
+      CRAWL_MAX_PAGES: ${CRAWL_MAX_PAGES:-2}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - ./spike_results:/spike_results:ro
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE: http://localhost:8000
+        VITE_AMAP_JS_KEY: ${AMAP_JS_KEY}
+        VITE_AMAP_JS_SECURITY: ${AMAP_JS_SECURITY}
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
