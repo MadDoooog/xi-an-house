@@ -1,12 +1,14 @@
 /* ============================================================
    西接通勤 · 注入 UI（ISOLATED world）
    运行环境：高德地图页面。Shadow DOM 隔离，不影响页面样式。
-   本版（0.1.0 / 阶段 3a）能力：
-     - 读取后台数据（IndexedDB）
-     - 通过 MAIN world 的挂钩拿像素投影
+   本版（0.2.0）能力：
+     - 默认干净状态：不预置任何小区/目的地，侧栏默认折叠成右边缘的抽屉标签
+     - 侧栏上下留白可调（躲开高德自带工具条）
+     - 目的地地址：粘贴「右键复制地址」得到的文本即可（含坐标则直接定位，
+       只有文字则用页面自带的 AMap.Geocoder 解析）
+     - 小区录入 / 编辑 / 删除（无外部数据依赖）
      - canvas 叠加：搜索范围、目的地 pin、小区点
-     - 侧边栏：条件摘要 / 泳道刻度尺 / 列表 / 两列详情 / 条件编辑
-     - 通勤值目前是「直线估算」，带 ~ 前缀；真值在阶段 3d 接入
+     - 通勤值仍是「直线估算」，带 ~ 前缀；真值在阶段 3d 接入
    ============================================================ */
 (function () {
   "use strict";
@@ -41,6 +43,8 @@
   const SRC_LABEL = { official: "官方数据", manual: "人工录入", poi: "POI 发现", seed: "样例数据" };
   const SRC_CLASS = { official: "badge--official", manual: "badge--manual", poi: "badge--poi", seed: "badge--seed" };
   const SRC_ORDER = { official: 4, manual: 3, poi: 2, seed: 1 };
+  const LAYOUT_DEFAULTS = { top: 72, bottom: 24 };
+  const MAX_DESTS = 5;
 
   const state = {
     settings: null,
@@ -52,11 +56,15 @@
     showOut: true,
     rows: [],
     roi: null,
+    dests: [],
     proj: null,
     hit: [],
     hoverId: null,
     hookReady: false,
-    hidden: false,
+    hidden: true,        // 默认折叠：只显示右边缘抽屉
+    form: null,          // 正在编辑的小区
+    formIsNew: false,
+    geoSeq: 0,
   };
 
   /* ---------------- 工具 ---------------- */
@@ -95,9 +103,134 @@
   const esc = (s) =>
     String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-  const totalOf = (c) => Math.round((c.avgPrice * (c.areaMin + c.areaMax)) / 2 / 10000);
+  const totalOf = (c) => {
+    const area = (Number(c.areaMin) + Number(c.areaMax)) / 2;
+    if (!(Number(c.avgPrice) > 0) || !(area > 0)) return null;
+    return Math.round((Number(c.avgPrice) * area) / 10000);
+  };
   const weakestSrc = (c) => c.sources.slice().sort((a, b) => (SRC_ORDER[a] || 0) - (SRC_ORDER[b] || 0))[0];
   const badge = (kind) => `<span class="badge ${SRC_CLASS[kind] || "badge--none"}">${SRC_LABEL[kind] || "未知"}</span>`;
+  const fmtPrice = (v) => (Number(v) > 0 ? Number(v).toLocaleString() : "未录入");
+  const fmtArea = (c) => (Number(c.areaMin) > 0 || Number(c.areaMax) > 0 ? `${c.areaMin}–${c.areaMax}` : "未录入");
+  const fmtTotal = (v) => (v == null ? "未录入" : v + " 万");
+
+  /* ---------------- 界面布局 / 提示 / 坐标解析 ---------------- */
+
+  function applyLayout() {
+    const L = Object.assign({}, LAYOUT_DEFAULTS, (state.settings && state.settings.layout) || {});
+    host.style.setProperty("--xat-inset-top", Math.max(0, Number(L.top) || 0) + "px");
+    host.style.setProperty("--xat-inset-bottom", Math.max(0, Number(L.bottom) || 0) + "px");
+  }
+
+  let toastTimer = null;
+  function toast(text) {
+    toastEl.textContent = text;
+    toastEl.classList.add("is-on");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toastEl.classList.remove("is-on"), 2600);
+  }
+
+  function setDrawerVisible(open) {
+    state.hidden = !open;
+    drawer.hidden = !!open;
+    side.classList.toggle("is-hidden", !open);
+    const h = $(".side-handle");
+    if (h) h.textContent = open ? "›" : "‹";
+    if (!open) tooltip.hidden = true;
+  }
+
+  /* 从任意文本里找经纬度：兼容 108.965,34.245 / (108.965, 34.245) / 108.965 34.245 */
+  const COORD_PAIR = /(-?\d{1,3}\.\d{2,8})\s*[,，\s]\s*(-?\d{1,2}\.\d{2,8})/;
+  function parseCoords(text) {
+    const m = String(text || "").match(COORD_PAIR);
+    if (!m) return null;
+    let lng = Number(m[1]);
+    let lat = Number(m[2]);
+    const okLng = (v) => v >= 73 && v <= 136;
+    const okLat = (v) => v >= 3 && v <= 54;
+    if (!okLng(lng) && okLat(lng) && okLng(lat)) {
+      const t = lng;
+      lng = lat;
+      lat = t;
+    }
+    if (!okLng(lng) || !okLat(lat)) return null;
+    return { lng, lat };
+  }
+
+  function stripCoords(text) {
+    return String(text || "")
+      .replace(/[（(]?\s*-?\d{1,3}\.\d{2,8}\s*[,，]\s*-?\d{1,2}\.\d{2,8}\s*[)）]?/g, " ")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+  }
+
+  function copyText(text) {
+    return new Promise((resolve) => {
+      const fallback = () => {
+        try {
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          ta.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0;";
+          document.body.appendChild(ta);
+          ta.select();
+          const ok = document.execCommand("copy");
+          ta.remove();
+          resolve(!!ok);
+        } catch (e) {
+          resolve(false);
+        }
+      };
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(() => resolve(true)).catch(fallback);
+          return;
+        }
+      } catch (e) {
+        /* 走兜底 */
+      }
+      fallback();
+    });
+  }
+
+  /* ---------------- 地址解析（借用页面自带的 AMap.Geocoder） ---------------- */
+
+  const geoWaiters = new Map();
+  function requestGeocode(text, cb) {
+    const reqId = ++state.geoSeq;
+    geoWaiters.set(reqId, cb);
+    window.postMessage({ __xat: "ui", type: "geocode", reqId, address: text, city: "西安" }, "*");
+    setTimeout(() => {
+      const f = geoWaiters.get(reqId);
+      if (f) {
+        geoWaiters.delete(reqId);
+        f({ ok: false, error: "地址解析超时（6 秒）" });
+      }
+    }, 6000);
+  }
+
+  /** 右键菜单「复制地址」被点时，MAIN world 把坐标发过来；这里转 WGS84 后写剪贴板 */
+  function onCtxCopy(payload) {
+    const p = payload || {};
+    const g = p.gcj;
+    if (!Array.isArray(g) || !Number.isFinite(g[0]) || !Number.isFinite(g[1])) {
+      toast("右键没取到坐标");
+      return;
+    }
+    const [lng, lat] = geo.gcj02ToWgs84(g[0], g[1]);
+    const coordText = `${lng.toFixed(6)},${lat.toFixed(6)}`;
+    const where = p.address || p.poi || "";
+    const text = where ? `${where} (${coordText})` : coordText;
+    copyText(text).then((ok) => {
+      if (!ok) {
+        toast("复制失败，请手动选中后 Ctrl+C");
+      } else if (where) {
+        toast("已复制地址，粘贴到「目的地」或「小区」输入框");
+      } else {
+        toast("已复制坐标（高德没返回地址文字，可用「解析」补地址）");
+      }
+      log.info("右键复制结果", { ok, text });
+    });
+  }
 
   /* ---------------- Shadow DOM 挂载 ---------------- */
 
@@ -119,6 +252,20 @@
   pill.className = "status-pill";
   pill.innerHTML = `<span class="status-dot"></span><b>西接通勤</b><small>等待地图…</small>`;
   shadow.appendChild(pill);
+
+  // 折叠态的抽屉标签（贴右边缘，位置跟随「顶部留白」设置）
+  const drawer = document.createElement("button");
+  drawer.className = "drawer";
+  drawer.title = "展开侧栏（西接通勤）";
+  drawer.innerHTML =
+    `<svg class="drawer__ico" viewBox="0 0 16 16" aria-hidden="true">` +
+    `<path d="M2 3.4h12M2 8h12M2 12.6h8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="square"/>` +
+    `</svg><span class="drawer__label">找房</span><span class="drawer__n" id="xat-drawer-n"></span>`;
+  shadow.appendChild(drawer);
+
+  const toastEl = document.createElement("div");
+  toastEl.className = "toast-line";
+  shadow.appendChild(toastEl);
 
   const side = document.createElement("aside");
   side.className = "side";
@@ -150,6 +297,7 @@
         <ul class="entries" id="xat-list"></ul>
         <div class="side__foot">
           <label class="check"><input type="checkbox" id="xat-showout" checked /> 显示不符合过滤的小区（灰点）</label>
+          <button class="btn btn--ghost btn--xs" data-act="new-community">＋ 添加小区</button>
           <span class="side__note" id="xat-note"></span>
         </div>
       </div>
@@ -201,9 +349,25 @@
           <div class="pane__body" id="xat-dbody"></div>
           <div class="pane__foot">
             <button class="btn btn--ghost btn--xs" data-act="open-options">设置与日志</button>
-            <button class="btn btn--primary btn--xs">编辑</button>
+            <button class="btn btn--primary btn--xs" data-act="edit-community">编辑小区</button>
           </div>
         </div>
+      </div>
+    </section>
+
+    <section class="pane pane--form" data-pane="form" hidden>
+      <div class="pane__head">
+        <div class="pane__headmain">
+          <h2 id="xat-form-title">添加小区</h2>
+          <div class="pane__headmeta" id="xat-form-meta"></div>
+        </div>
+        <button class="iconbtn" data-act="cancel-form" title="取消">×</button>
+      </div>
+      <div class="pane__body" id="xat-form-body"></div>
+      <div class="pane__foot">
+        <button class="btn btn--ghost btn--xs" data-act="form-delete">删除</button>
+        <button class="btn btn--ghost" data-act="cancel-form">取消</button>
+        <button class="btn btn--primary" data-act="form-save">保存</button>
       </div>
     </section>
   `;
@@ -220,11 +384,25 @@
 
   /* ---------------- 派生计算 ---------------- */
 
+  function validDests() {
+    const all = (state.settings && state.settings.destinations) || [];
+    return all.filter((d) => d && Number.isFinite(d.lng) && Number.isFinite(d.lat)).slice(0, MAX_DESTS);
+  }
+
   function compute() {
     const s = state.settings;
-    const dests = s.destinations.slice(0, s.destinationCount || 1);
+    const dests = validDests();
+    state.dests = dests;
+
+    if (!dests.length) {
+      state.rows = [];
+      state.roi = null;
+      return [];
+    }
+
     const mec = geo.minEnclosingCircle(dests.map((d) => [d.lng, d.lat]));
-    const roi = { center: mec.center, radius: mec.radius + (s.radiusKm || 0) * 1000, mec };
+    const radius = Math.max(mec.radius + (s.radiusKm || 0) * 1000, 150);
+    const roi = { center: mec.center, radius, mec };
 
     const rows = [];
     for (const c of state.communities) {
@@ -236,9 +414,10 @@
       const worst = Math.max.apply(null, mins);
       const total = totalOf(c);
       const ok =
+        total != null &&
         total >= s.budget.totalMin && total <= s.budget.totalMax &&
-        c.areaMax >= s.budget.areaMin && c.areaMin <= s.budget.areaMax &&
-        c.avgPrice <= s.budget.priceMax &&
+        Number(c.areaMax) >= s.budget.areaMin && Number(c.areaMin) <= s.budget.areaMax &&
+        Number(c.avgPrice) <= s.budget.priceMax &&
         (s.tenure.length === 0 || s.tenure.indexOf(c.propertyType) >= 0);
 
       rows.push({ ...c, mins, worst, total, ok, dCenter, exact: false });
@@ -246,14 +425,13 @@
 
     rows.sort((a, b) => {
       if (a.ok !== b.ok) return a.ok ? -1 : 1;
-      if (state.sort === "total") return a.total - b.total;
-      if (state.sort === "price") return a.avgPrice - b.avgPrice;
+      if (state.sort === "total") return (a.total == null ? Infinity : a.total) - (b.total == null ? Infinity : b.total);
+      if (state.sort === "price") return Number(a.avgPrice) - Number(b.avgPrice);
       return a.worst - b.worst;
     });
 
     state.rows = rows;
     state.roi = roi;
-    state.dests = dests;
     log.debug("已重算候选集", { inRoi: rows.length, ok: rows.filter((r) => r.ok).length, radiusKm: s.radiusKm, dests: dests.length });
     return rows;
   }
@@ -262,16 +440,26 @@
 
   function renderCond() {
     const s = state.settings;
-    const modes = Array.from(new Set(state.dests.map((d) => MODE_LABEL[d.mode]))).join("/");
-    $("#xat-cond").innerHTML =
-      `<em>${state.dests.length}</em> 个目的地 · <em>${modes}</em> · <em>${Number(s.radiusKm).toFixed(1)}</em> km · ` +
-      `<em>${s.budget.totalMin}–${s.budget.totalMax}</em> 万`;
+    const all = (s.destinations || []);
+    const modes = Array.from(new Set(state.dests.map((d) => MODE_LABEL[d.mode] || "驾车"))).join("/");
+    const txt = state.dests.length
+      ? `<em>${state.dests.length}</em> 个目的地 · <em>${modes}</em> · <em>${Number(s.radiusKm).toFixed(1)}</em> km · <em>${s.budget.totalMin}–${s.budget.totalMax}</em> 万`
+      : all.length
+        ? `<em>${all.length}</em> 个目的地待定位 · 点这里解析地址`
+        : `<em>还没设目的地</em> · 点这里粘贴地址`;
+    $("#xat-cond").innerHTML = txt;
     side.classList.toggle("is-detail", state.panel === "detail");
     side.classList.toggle("is-edit", state.panel === "edit");
+    side.classList.toggle("is-form", state.panel === "form");
   }
 
   const LANE_MAX = 60;
   function renderLanes() {
+    if (!state.dests.length) {
+      $("#xat-lanes").innerHTML = "";
+      $("#xat-axis").innerHTML = "";
+      return;
+    }
     const pct = (m) => (Math.min(m / LANE_MAX, 1) * 100).toFixed(2) + "%";
     $("#xat-lanes").innerHTML = state.dests
       .map((d, di) => {
@@ -302,11 +490,34 @@
     $("#xat-cin").textContent = state.rows.length;
     $("#xat-cok").textContent = ok;
     $("#xat-n").textContent = ok;
-    $("#xat-note").textContent = "通勤为直线估算（带 ~），真实值在阶段 3d 接入；地图数据来自本机样例库。";
+    const dn = $("#xat-drawer-n");
+    if (dn) dn.textContent = ok ? String(ok) : "";
+    $("#xat-note").textContent = state.communities.length
+      ? `本机共 ${state.communities.length} 个小区；通勤为直线估算（带 ~）。`
+      : "小区库还是空的：点下方「＋ 添加小区」，或在设置页导入数据。";
+
+    if (!state.dests.length) {
+      const n = state.communities.length;
+      $("#xat-list").innerHTML = `<li class="empty">
+        <div class="empty__t">先设一个目的地</div>
+        <div class="empty__d">在高德地图上右键 →「复制地址」，粘贴到「筛选条件」里的目的地输入框；<br />
+        有了目的地才会画出搜索范围${n ? `，库里已有 <b>${n}</b> 个小区会按范围筛出来` : "和小区"}。</div>
+        <button class="btn btn--primary btn--xs" data-act="edit" style="margin-top:10px">去设置目的地</button>
+      </li>`;
+      $$("[data-act='edit']", $("#xat-list")).forEach((b) => b.addEventListener("click", () => setPanel("edit")));
+      return;
+    }
 
     if (!rows.length) {
-      $("#xat-list").innerHTML = `<li class="empty"><div class="empty__t">范围内没有小区</div>
-        <div class="empty__d">把扩展半径调大试试，或检查目的地坐标。</div></li>`;
+      const noneInDb = state.communities.length === 0;
+      $("#xat-list").innerHTML = `<li class="empty">
+        <div class="empty__t">${noneInDb ? "小区库是空的" : "范围内没有小区"}</div>
+        <div class="empty__d">${noneInDb
+          ? "还没有任何小区数据：可以点下方「＋ 添加小区」手动录入（右键复制地址直接带坐标），也可以在设置页导入官方数据。"
+          : "把扩展半径调大试试，或者检查目的地坐标是否落在你想看的片区。"}</div>
+        ${noneInDb ? `<button class="btn btn--primary btn--xs" data-act="new-community" style="margin-top:10px">＋ 添加小区</button>` : ""}
+      </li>`;
+      $$("[data-act='new-community']", $("#xat-list")).forEach((b) => b.addEventListener("click", () => openCommunityForm(null)));
       return;
     }
 
@@ -325,8 +536,8 @@
               ${r.ok ? "" : `<span class="badge badge--none">不符合过滤</span>`}
             </div>
             <div class="pills">${pills}</div>
-            <div class="entry__meta"><span class="num">${r.avgPrice.toLocaleString()}</span> 元/㎡ ·
-              <span class="num">${r.total}</span> 万 · <span class="num">${r.areaMin}–${r.areaMax}</span> ㎡ · ${esc(r.tenureYears)}</div>
+            <div class="entry__meta"><span class="num">${fmtPrice(r.avgPrice)}</span> 元/㎡ ·
+              <span class="num">${fmtTotal(r.total)}</span> · <span class="num">${fmtArea(r)}</span> ㎡ · ${esc(r.tenureYears || "—")}</div>
           </div>
           <div class="entry__worst entry__worst--est"><b>${r.worst}</b><span>最长</span></div>
         </li>`;
@@ -357,7 +568,7 @@
           <span class="mini__idx">${String(i + 1).padStart(2, "0")}</span>
           <span class="mini__name">${esc(r.name)}</span>
           <b class="mini__min is-est">${r.worst}</b>
-          <span class="mini__price">${r.total} 万 · ${r.avgPrice.toLocaleString()} 元/㎡</span>
+          <span class="mini__price">${fmtTotal(r.total)} · ${fmtPrice(r.avgPrice)} 元/㎡</span>
         </li>`;
       })
       .join("");
@@ -396,7 +607,7 @@
     const r = state.rows.find((x) => x.id === state.selected);
     if (!r) return;
     $("#xat-dname").textContent = r.name;
-    $("#xat-dmeta").innerHTML = `${esc(r.district)} · ${esc(r.sub)} ${badge(weakestSrc(r))}` +
+    $("#xat-dmeta").innerHTML = `${esc(r.district || "未填行政区")} · ${esc(r.sub || "—")} ${badge(weakestSrc(r))}` +
       (r.ok ? "" : `<span class="badge badge--none">不符合过滤</span>`);
 
     const commute = state.dests
@@ -414,22 +625,27 @@
       .join("");
 
     const why = [];
-    why.push(`落在搜索范围内：距圆心 <span class="num">${(r.dCenter / 1000).toFixed(1)}</span> km，范围半径 <span class="num">${(state.roi.radius / 1000).toFixed(1)}</span> km。`);
+    if (state.roi) {
+      why.push(`落在搜索范围内：距圆心 <span class="num">${(r.dCenter / 1000).toFixed(1)}</span> km，范围半径 <span class="num">${(state.roi.radius / 1000).toFixed(1)}</span> km。`);
+    }
     if (!r.ok) {
       const w = [];
-      if (r.total < state.settings.budget.totalMin || r.total > state.settings.budget.totalMax) w.push(`总价 ${r.total} 万不在区间内`);
-      if (r.avgPrice > state.settings.budget.priceMax) w.push(`均价 ${r.avgPrice.toLocaleString()} 超过上限`);
+      if (r.total == null) w.push("没有价格/面积信息，无法判断是否在预算内");
+      else if (r.total < state.settings.budget.totalMin || r.total > state.settings.budget.totalMax) w.push(`总价 ${r.total} 万不在区间内`);
+      if (r.avgPrice > state.settings.budget.priceMax) w.push(`均价 ${Number(r.avgPrice).toLocaleString()} 超过上限`);
       if (state.settings.tenure.length && state.settings.tenure.indexOf(r.propertyType) < 0) w.push(`产权「${r.propertyType}」不在筛选内`);
       why.length = 0;
       why.push(`<b>不符合过滤</b>：${w.join("；") || "面积与筛选区间不重叠"}。仍显示是因为打开了「显示不符合过滤」。`);
     }
+
+    const built = Number(r.buildYear) > 0 ? `${r.buildYear} 年 · 房龄 ${new Date().getFullYear() - r.buildYear} 年` : null;
 
     $("#xat-dbody").innerHTML = `
       <div class="detail__thumb"><div><b>卫星影像</b>待接入天地图 tk<br />用来核对"这真的是住宅小区吗"</div></div>
 
       <div class="cblock">
         <div class="cblock__title">通勤（${state.dests.length} 个目的地 · 估算）</div>
-        ${commute}
+        ${commute || `<p class="hint" style="margin-top:0">还没有目的地，先去「筛选条件」里加一个。</p>`}
         <p class="hint">点「去高德算」会在新标签打开高德的路线规划，真实时长由高德计算（读回在阶段 3d 接入）。</p>
       </div>
 
@@ -441,18 +657,18 @@
       <div class="cblock">
         <div class="cblock__title">基本信息</div>
         ${crow("位置", `<span class="num">${r.lng.toFixed(4)}, ${r.lat.toFixed(4)}</span>`, "manual")}
-        ${crow("行政区 / 板块", `${esc(r.district)} · ${esc(r.sub)}`, "manual")}
-        ${crow("建成年份", `<span class="num">${r.buildYear}</span> 年 · 房龄 <span class="num">${new Date().getFullYear() - r.buildYear}</span> 年`, "manual")}
+        ${crow("行政区 / 板块", `${esc(r.district || "—")} · ${esc(r.sub || "—")}`, "manual")}
+        ${crow("建成年份", built, built ? "manual" : null)}
         ${crow("边界多边形", null, null)}
       </div>
 
       <div class="cblock">
         <div class="cblock__title">价格与产权</div>
-        ${crow("均价", `<span class="num">${r.avgPrice.toLocaleString()}</span> 元/㎡`, "manual")}
-        ${crow("面积区间", `<span class="num">${r.areaMin}–${r.areaMax}</span> ㎡`, "manual")}
-        ${crow("总价约", `<span class="num">${r.total}</span> 万`, "manual")}
-        ${crow("产权性质", `${esc(r.propertyType)} · ${esc(r.tenureYears)}`, "manual")}
-        ${crow("备案价", r.official ? `<span class="num">${r.official.filingPrice.toLocaleString()}</span> 元/㎡` : null, r.official ? "official" : null)}
+        ${crow("均价", Number(r.avgPrice) > 0 ? `<span class="num">${Number(r.avgPrice).toLocaleString()}</span> 元/㎡` : null, Number(r.avgPrice) > 0 ? "manual" : null)}
+        ${crow("面积区间", Number(r.areaMin) > 0 || Number(r.areaMax) > 0 ? `<span class="num">${fmtArea(r)}</span> ㎡` : null, Number(r.areaMin) > 0 ? "manual" : null)}
+        ${crow("总价约", r.total == null ? null : `<span class="num">${r.total}</span> 万`, r.total == null ? null : "manual")}
+        ${crow("产权性质", `${esc(r.propertyType || "待确认")} · ${esc(r.tenureYears || "—")}`, "manual")}
+        ${crow("备案价", r.official ? `<span class="num">${Number(r.official.filingPrice).toLocaleString()}</span> 元/㎡` : null, r.official ? "official" : null)}
         ${crow("预售证 / 去化", r.official ? `${esc(r.official.permitNo)} · 已售 <span class="num">${Math.round(r.official.soldRatio * 100)}</span>%` : null, r.official ? "official" : null)}
       </div>
 
@@ -466,30 +682,41 @@
     $$("[data-goto]").forEach((b) => b.addEventListener("click", () => gotoAmap(Number(b.dataset.goto))));
   }
 
+  function destRowHtml(d, i, total) {
+    const ok = Number.isFinite(d.lng) && Number.isFinite(d.lat);
+    const coord = ok
+      ? `${Number(d.lng).toFixed(6)}, ${Number(d.lat).toFixed(6)}`
+      : "坐标未定位 · 粘贴地址后点「解析」";
+    return `<li class="dest" data-di="${i}">
+      <span class="dest__k" style="background:${DEST_COLORS[i % DEST_COLORS.length]}">${DIGITS[i] || i + 1}</span>
+      <div class="dest__main">
+        <div class="dest__row">
+          <input class="input" data-dname="${i}" value="${esc(d.name || "")}" placeholder="粘贴右键复制来的地址" />
+          <button class="dest__parse" data-dparse="${i}">解析</button>
+        </div>
+        <div class="dest__coord ${ok ? "is-ok" : "is-bad"}">${esc(coord)}</div>
+        <div class="seg">
+          ${Object.keys(MODE_LABEL)
+            .map((m) => `<button class="seg__btn${d.mode === m ? " is-on" : ""}" data-dmode="${i}:${m}">${MODE_LABEL[m]}</button>`)
+            .join("")}
+        </div>
+      </div>
+      <button class="dest__del" data-ddel="${i}" ${total <= 1 ? "disabled" : ""}>✕</button>
+    </li>`;
+  }
+
   function renderEdit() {
     const s = state.settings;
+    const all = s.destinations || [];
+    const L = Object.assign({}, LAYOUT_DEFAULTS, s.layout || {});
     $("#xat-edit-body").innerHTML = `
       <fieldset class="field">
-        <legend>目的地</legend>
-        <ul class="dests">
-          ${state.dests
-            .map(
-              (d, di) => `<li class="dest">
-              <span class="dest__k" style="background:${DEST_COLORS[di]}">${DIGITS[di]}</span>
-              <div class="dest__main">
-                <input class="input" value="${esc(d.name)}" data-dname="${di}" />
-                <div class="seg">
-                  ${Object.keys(MODE_LABEL)
-                    .map((m) => `<button class="seg__btn${d.mode === m ? " is-on" : ""}" data-dmode="${di}:${m}">${MODE_LABEL[m]}</button>`)
-                    .join("")}
-                </div>
-              </div>
-              <button class="dest__del" data-ddel="${di}" ${state.dests.length <= 1 ? "disabled" : ""}>✕</button>
-            </li>`
-            )
-            .join("")}
-        </ul>
-        <p class="hint">地址改了不会自动解析坐标（阶段 3b 接地址搜索）。目前坐标来自样例库。</p>
+        <legend>目的地（最多 ${MAX_DESTS} 个）</legend>
+        ${all.length
+          ? `<ul class="dests">${all.map((d, i) => destRowHtml(d, i, all.length)).join("")}</ul>`
+          : `<p class="hint" style="margin-top:0">还没有目的地。在高德地图上<b>右键 → 复制地址</b>，再点下面的「＋ 添加目的地」把地址粘进去。</p>`}
+        <button class="btn btn--ghost btn--xs" data-act="add-dest" ${all.length >= MAX_DESTS ? "disabled" : ""}>＋ 添加目的地</button>
+        <p class="hint">粘贴内容里带坐标（形如 <code>108.965123,34.245678</code>）会直接定位；只有文字时用高德页面自带的解析接口（需要高德页面联网正常）。</p>
       </fieldset>
 
       <fieldset class="field">
@@ -498,13 +725,26 @@
           <span>半径 <em class="num" id="xat-rad-out">${Number(s.radiusKm).toFixed(1)}</em> km</span>
           <input type="range" id="xat-rad" min="0" max="150" value="${Math.round(s.radiusKm * 10)}" />
         </label>
-        <p class="hint">${state.dests.length} 个目的地 → 取最小外接圆，再向外扩 ${Number(s.radiusKm).toFixed(1)} km。</p>
+        <p class="hint">${all.length} 个目的地 → 取最小外接圆，再向外扩 ${Number(s.radiusKm).toFixed(1)} km。</p>
+      </fieldset>
+
+      <fieldset class="field">
+        <legend>侧栏位置</legend>
+        <label class="slider">
+          <span>顶部留白 <em class="num" id="xat-top-out">${Math.round(Number(L.top))}</em> px</span>
+          <input type="range" id="xat-lay-top" min="0" max="260" step="4" value="${Math.round(Number(L.top))}" />
+        </label>
+        <label class="slider">
+          <span>底部留白 <em class="num" id="xat-bot-out">${Math.round(Number(L.bottom))}</em> px</span>
+          <input type="range" id="xat-lay-bottom" min="0" max="260" step="4" value="${Math.round(Number(L.bottom))}" />
+        </label>
+        <p class="hint">让侧栏躲开高德右上角的工具条（卫星/图层/测距）和底部版权条；拖动立即生效，保存后下次也生效。</p>
       </fieldset>
 
       <fieldset class="field">
         <legend>预算与面积</legend>
-        <p class="hint" style="margin-top:0">总价 ${s.budget.totalMin}–${s.budget.totalMax} 万 · 面积 ${s.budget.areaMin}–${s.budget.areaMax} ㎡ · 均价上限 ${s.budget.priceMax.toLocaleString()} 元/㎡</p>
-        <p class="hint">阶段 3a 先固定，滑块在下一版接上。</p>
+        <p class="hint" style="margin-top:0">总价 ${s.budget.totalMin}–${s.budget.totalMax} 万 · 面积 ${s.budget.areaMin}–${s.budget.areaMax} ㎡ · 均价上限 ${Number(s.budget.priceMax).toLocaleString()} 元/㎡</p>
+        <p class="hint">滑块在下一版接上，目前是固定值。</p>
       </fieldset>
 
       <fieldset class="field">
@@ -516,17 +756,79 @@
         </div>
       </fieldset>
     `;
+    bindEditEvents();
+  }
+
+  function bindEditEvents() {
+    const s = state.settings;
 
     $("#xat-rad").addEventListener("input", (e) => {
-      state.settings.radiusKm = Number(e.target.value) / 10;
-      $("#xat-rad-out").textContent = Number(state.settings.radiusKm).toFixed(1);
+      s.radiusKm = Number(e.target.value) / 10;
+      $("#xat-rad-out").textContent = Number(s.radiusKm).toFixed(1);
       recomputeAndRender();
     });
+
+    const layTop = $("#xat-lay-top");
+    const layBottom = $("#xat-lay-bottom");
+    if (layTop) {
+      layTop.addEventListener("input", (e) => {
+        s.layout = Object.assign({}, LAYOUT_DEFAULTS, s.layout || {}, { top: Number(e.target.value) });
+        $("#xat-top-out").textContent = Math.round(Number(s.layout.top));
+        applyLayout();
+      });
+    }
+    if (layBottom) {
+      layBottom.addEventListener("input", (e) => {
+        s.layout = Object.assign({}, LAYOUT_DEFAULTS, s.layout || {}, { bottom: Number(e.target.value) });
+        $("#xat-bot-out").textContent = Math.round(Number(s.layout.bottom));
+        applyLayout();
+      });
+    }
+
+    $$("[data-dname]").forEach((el) => {
+      const idx = Number(el.dataset.dname);
+      el.addEventListener("input", () => {
+        const d = s.destinations[idx];
+        if (!d) return;
+        d.name = el.value;
+        // 打字/粘贴过程中一旦出现坐标就立刻定位（不重绘输入框，免得打断输入）
+        const coords = parseCoords(el.value);
+        if (coords && (d.lng !== coords.lng || d.lat !== coords.lat)) {
+          d.lng = coords.lng;
+          d.lat = coords.lat;
+          const row = el.closest(".dest");
+          const coordEl = row ? row.querySelector(".dest__coord") : null;
+          if (coordEl) {
+            coordEl.textContent = coords.lng.toFixed(6) + ", " + coords.lat.toFixed(6);
+            coordEl.classList.remove("is-bad");
+            coordEl.classList.add("is-ok");
+          }
+          compute();
+          renderCond();
+          renderLanes();
+          renderList();
+          requestProjection();
+          maybeFitToDests();
+        }
+      });
+      el.addEventListener("paste", () => {
+        setTimeout(() => autoApplyIfCoords(idx), 0);
+      });
+      el.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          parseDest(idx);
+        }
+      });
+    });
+
+    $$("[data-dparse]").forEach((b) => b.addEventListener("click", () => parseDest(Number(b.dataset.dparse))));
 
     $$("[data-dmode]").forEach((b) =>
       b.addEventListener("click", () => {
         const [di, mode] = b.dataset.dmode.split(":");
-        state.settings.destinations[Number(di)].mode = mode;
+        const d = s.destinations[Number(di)];
+        if (d) d.mode = mode;
         renderEdit();
         recomputeAndRender();
       })
@@ -534,9 +836,8 @@
 
     $$("[data-ddel]").forEach((b) =>
       b.addEventListener("click", () => {
-        if (state.dests.length <= 1) return;
-        state.settings.destinations.splice(Number(b.dataset.ddel), 1);
-        state.settings.destinationCount = state.settings.destinations.length;
+        s.destinations.splice(Number(b.dataset.ddel), 1);
+        s.destinationCount = s.destinations.length;
         renderEdit();
         recomputeAndRender();
       })
@@ -545,13 +846,315 @@
     $$("[data-tenure]").forEach((b) =>
       b.addEventListener("click", () => {
         const t = b.dataset.tenure;
-        const i = state.settings.tenure.indexOf(t);
-        if (i >= 0) state.settings.tenure.splice(i, 1);
-        else state.settings.tenure.push(t);
+        const i = s.tenure.indexOf(t);
+        if (i >= 0) s.tenure.splice(i, 1);
+        else s.tenure.push(t);
         renderEdit();
         recomputeAndRender();
       })
     );
+  }
+
+  /** 目的地解析：文本里带坐标就直接用，否则走页面自带的 Geocoder */
+  function parseDest(idx) {
+    const s = state.settings;
+    const d = (s.destinations || [])[idx];
+    if (!d) return;
+    const input = $(`[data-dname="${idx}"]`);
+    const raw = (input ? input.value : d.name || "").trim();
+    if (!raw) return toast("先粘贴一个地址");
+    d.name = stripCoords(raw) || raw;
+
+    const coords = parseCoords(raw);
+    if (coords) {
+      d.lng = coords.lng;
+      d.lat = coords.lat;
+      renderEdit();
+      recomputeAndRender();
+      toast("已按文本里的坐标定位");
+      return;
+    }
+
+    const btn = $(`[data-dparse="${idx}"]`);
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "解析中…";
+    }
+    requestGeocode(raw, (res) => {
+      if (res && res.ok) {
+        const [lng, lat] = geo.gcj02ToWgs84(res.gcj[0], res.gcj[1]);
+        d.lng = lng;
+        d.lat = lat;
+        d.name = raw;
+        toast("已定位：" + (res.address || raw));
+      } else {
+        d.lng = null;
+        d.lat = null;
+        toast("地址没解析出来：" + ((res && res.error) || "未知原因"));
+      }
+      renderEdit();
+      recomputeAndRender();
+    });
+  }
+
+  /** 粘贴后如果发现坐标，直接定位，不用再点「解析」 */
+  function autoApplyIfCoords(idx) {
+    const s = state.settings;
+    const d = (s.destinations || [])[idx];
+    const input = $(`[data-dname="${idx}"]`);
+    if (!d || !input) return;
+    const coords = parseCoords(input.value);
+    if (!coords) return;
+    d.name = stripCoords(input.value) || input.value.trim();
+    d.lng = coords.lng;
+    d.lat = coords.lat;
+    renderEdit();
+    recomputeAndRender();
+    toast("已识别到坐标");
+  }
+
+  /* ---------------- 小区录入 / 编辑 ---------------- */
+
+  function openCommunityForm(id) {
+    const row = id ? state.communities.find((c) => c.id === id) : null;
+    state.formIsNew = !row;
+    state.form = row
+      ? Object.assign({}, row)
+      : {
+          id: null,
+          name: "",
+          district: null,
+          sub: null,
+          lng: null,
+          lat: null,
+          avgPrice: 0,
+          areaMin: 0,
+          areaMax: 0,
+          buildYear: null,
+          tenureYears: "70年",
+          propertyType: "商品房",
+          tags: [],
+          sources: ["manual"],
+          official: null,
+        };
+    setPanel("form");
+  }
+
+  function renderForm() {
+    const f = state.form;
+    if (!f) return;
+    const ok = Number.isFinite(f.lng) && Number.isFinite(f.lat);
+    $("#xat-form-title").textContent = state.formIsNew ? "添加小区" : "编辑小区";
+    $("#xat-form-meta").innerHTML = state.formIsNew
+      ? "名称 + 坐标就能存，其余可以后补"
+      : `${badge((f.sources || ["manual"])[0])} <span class="muted">ID ${esc(f.id)}</span>`;
+    const props = ["商品房", "经济适用房", "安置房", "公寓", "房改房", "待确认"];
+
+    $("#xat-form-body").innerHTML = `
+      <div class="formgrid">
+        <div class="formrow">
+          <label>名称 / 地址</label>
+          <div class="dest__row">
+            <input class="input" id="xat-fname" value="${esc(f.name || "")}" placeholder="粘贴右键复制来的地址，或手填小区名" />
+            <button class="dest__parse" id="xat-fparse">解析</button>
+          </div>
+        </div>
+        <div class="formrow">
+          <label>坐标</label>
+          <div class="dest__coord ${ok ? "is-ok" : "is-bad"}" id="xat-fcoord">${ok ? Number(f.lng).toFixed(6) + ", " + Number(f.lat).toFixed(6) : "未定位"}</div>
+        </div>
+        <div class="formrow">
+          <label>均价 元/㎡</label>
+          <input class="input" id="xat-fprice" type="number" min="0" step="100" value="${Number(f.avgPrice) || 0}" />
+        </div>
+        <div class="formrow formrow--pair">
+          <label>面积 ㎡</label>
+          <input class="input" id="xat-farea-min" type="number" min="0" step="1" value="${Number(f.areaMin) || 0}" placeholder="最小" />
+          <span class="sep">–</span>
+          <input class="input" id="xat-farea-max" type="number" min="0" step="1" value="${Number(f.areaMax) || 0}" placeholder="最大" />
+        </div>
+        <div class="formrow">
+          <label>建成年份</label>
+          <input class="input" id="xat-fyear" type="number" min="1950" max="2035" value="${Number(f.buildYear) || ""}" placeholder="例如 2016" />
+        </div>
+        <div class="formrow">
+          <label>产权性质</label>
+          <div class="chips">
+            ${props.map((p) => `<button class="chip${f.propertyType === p ? " is-on" : ""}" data-fprop="${p}">${p}</button>`).join("")}
+          </div>
+        </div>
+        <div class="formrow">
+          <label>标签</label>
+          <input class="input" id="xat-ftags" value="${esc((f.tags || []).join(" "))}" placeholder="空格分隔，例如：临铁 学区" />
+        </div>
+        <div class="formrow">
+          <label>行政区</label>
+          <input class="input" id="xat-fdistrict" value="${esc(f.district || "")}" placeholder="雁塔 / 高新 …（可留空）" />
+        </div>
+      </div>
+      <div class="formnote">
+        <b>怎么快速定位？</b> 在高德地图上对着小区位置<b>右键 →「复制地址（西接通勤）」</b>，
+        再把剪贴板内容粘到上面的「名称 / 地址」框，会自动带出坐标（形如 <code>108.965123,34.245678</code>）；
+        只有地名时点「解析」，用高德页面自带的接口换算。
+      </div>
+    `;
+
+    const nameEl = $("#xat-fname");
+    nameEl.addEventListener("input", () => {
+      f.name = nameEl.value;
+      const coords = parseCoords(nameEl.value);
+      if (coords && (f.lng !== coords.lng || f.lat !== coords.lat)) {
+        f.lng = coords.lng;
+        f.lat = coords.lat;
+        const c = $("#xat-fcoord");
+        if (c) {
+          c.textContent = coords.lng.toFixed(6) + ", " + coords.lat.toFixed(6);
+          c.classList.remove("is-bad");
+          c.classList.add("is-ok");
+        }
+      }
+    });
+    nameEl.addEventListener("paste", () => setTimeout(() => formParseCoords(true), 0));
+    nameEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        formParseCoords(false);
+      }
+    });
+    $("#xat-fparse").addEventListener("click", () => formParseCoords(false));
+    $$("[data-fprop]").forEach((b) =>
+      b.addEventListener("click", () => {
+        f.propertyType = b.dataset.fprop;
+        $$("[data-fprop]").forEach((x) => x.classList.toggle("is-on", x === b));
+      })
+    );
+  }
+
+  function formParseCoords(onlyIfCoords) {
+    const f = state.form;
+    if (!f) return;
+    const el = $("#xat-fname");
+    const raw = (el ? el.value : f.name || "").trim();
+    if (!raw) return toast("先填名称或地址");
+    f.name = stripCoords(raw) || raw;
+
+    const coords = parseCoords(raw);
+    if (coords) {
+      f.lng = coords.lng;
+      f.lat = coords.lat;
+      const c = $("#xat-fcoord");
+      if (c) {
+        c.textContent = Number(f.lng).toFixed(6) + ", " + Number(f.lat).toFixed(6);
+        c.classList.remove("is-bad");
+        c.classList.add("is-ok");
+      }
+      if (el) el.value = f.name;
+      toast("已识别坐标");
+      return;
+    }
+    if (onlyIfCoords) return;
+
+    const btn = $("#xat-fparse");
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "解析中…";
+    }
+    requestGeocode(raw, (res) => {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "解析";
+      }
+      if (res && res.ok) {
+        const [lng, lat] = geo.gcj02ToWgs84(res.gcj[0], res.gcj[1]);
+        f.lng = lng;
+        f.lat = lat;
+        const c = $("#xat-fcoord");
+        if (c) {
+          c.textContent = lng.toFixed(6) + ", " + lat.toFixed(6);
+          c.classList.remove("is-bad");
+          c.classList.add("is-ok");
+        }
+        toast("已定位：" + (res.address || raw));
+      } else {
+        toast("没解析出坐标：" + ((res && res.error) || "未知原因"));
+      }
+    });
+  }
+
+  function readFormInputs() {
+    const f = state.form;
+    if (!f) return null;
+    const nameEl = $("#xat-fname");
+    const priceEl = $("#xat-fprice");
+    const amin = $("#xat-farea-min");
+    const amax = $("#xat-farea-max");
+    const year = $("#xat-fyear");
+    const tags = $("#xat-ftags");
+    const district = $("#xat-fdistrict");
+    if (nameEl) f.name = nameEl.value.trim();
+    if (priceEl) f.avgPrice = Number(priceEl.value) || 0;
+    if (amin) f.areaMin = Number(amin.value) || 0;
+    if (amax) f.areaMax = Number(amax.value) || 0;
+    if (year) f.buildYear = Number(year.value) || null;
+    if (tags) f.tags = (tags.value || "").split(/\s+/).filter(Boolean);
+    if (district) f.district = district.value.trim() || null;
+
+    if (!f.name) {
+      toast("名称不能为空");
+      return null;
+    }
+    if (!Number.isFinite(f.lng) || !Number.isFinite(f.lat)) {
+      toast("还没有坐标：粘贴右键复制的地址，或点「解析」");
+      return null;
+    }
+    if (f.areaMax > 0 && f.areaMin > f.areaMax) {
+      const t = f.areaMin;
+      f.areaMin = f.areaMax;
+      f.areaMax = t;
+    }
+    if (!f.areaMax) f.areaMax = f.areaMin;
+    return f;
+  }
+
+  async function saveForm() {
+    const f = readFormInputs();
+    if (!f) return;
+    try {
+      const saved = await rpc("community.put", { community: f });
+      const i = state.communities.findIndex((c) => c.id === saved.id);
+      if (i >= 0) state.communities[i] = saved;
+      else state.communities.push(saved);
+      state.form = null;
+      setPanel("list");
+      recomputeAndRender();
+      toast("已保存：" + saved.name);
+    } catch (e) {
+      log.error("保存小区失败", { error: String(e) });
+      toast("保存失败：" + e.message);
+    }
+  }
+
+  async function deleteForm() {
+    const f = state.form;
+    if (!f) return;
+    if (!f.id) {
+      state.form = null;
+      setPanel("list");
+      return;
+    }
+    if (!window.confirm(`删除「${f.name || "这个小区"}」？`)) return;
+    try {
+      await rpc("community.del", { id: f.id });
+    } catch (e) {
+      toast("删除失败：" + e.message);
+      return;
+    }
+    state.communities = state.communities.filter((c) => c.id !== f.id);
+    if (state.selected === f.id) state.selected = null;
+    state.form = null;
+    setPanel("list");
+    recomputeAndRender();
+    toast("已删除");
   }
 
   function render() {
@@ -561,24 +1164,28 @@
     renderMini();
     if (state.panel === "detail") renderDetail();
     if (state.panel === "edit") renderEdit();
+    if (state.panel === "form") renderForm();
   }
 
   function recomputeAndRender() {
     compute();
     render();
     requestProjection();
+    maybeFitToDests();
   }
 
   function setPanel(p) {
     state.panel = p;
     $$(".pane").forEach((el) => (el.hidden = el.dataset.pane !== p));
-    renderCond();
     if (p === "edit") renderEdit();
     if (p === "detail") renderDetail();
+    if (p === "form") renderForm();
+    renderCond();
   }
 
   function select(id) {
     state.selected = id;
+    setDrawerVisible(true);
     renderDetail();
     renderMini();
     renderLanes();
@@ -675,7 +1282,12 @@
   }
 
   function draw() {
-    if (!state.proj || !state.roi) return;
+    if (!state.roi) {
+      ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+      state.hit = [];
+      return;
+    }
+    if (!state.proj) return;
     const { points, toScreen } = state.proj;
     ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
 
@@ -855,6 +1467,21 @@
       return;
     }
 
+    if (data.type === "ctx-copy") {
+      onCtxCopy(data.payload);
+      return;
+    }
+
+    if (data.type === "geocode-result") {
+      const p = data.payload || {};
+      const cb = geoWaiters.get(p.reqId);
+      if (cb) {
+        geoWaiters.delete(p.reqId);
+        cb(p);
+      }
+      return;
+    }
+
     if (data.type === "hook-failed") {
       setStatus("bad", "未挂钩：地图实例没拿到");
       reportDiag({ hookReady: false, reason: (data.payload || {}).reason });
@@ -862,19 +1489,32 @@
     }
   });
 
-  let fitDone = false;
+  let lastFitKey = "";
   function fitToRoi() {
-    if (fitDone || !state.roi) return;
-    fitDone = true;
+    if (!state.roi) return;
+    const L = Object.assign({}, LAYOUT_DEFAULTS, (state.settings && state.settings.layout) || {});
+    const padTop = Math.max(0, Number(L.top) || 0);
+    const padBottom = Math.max(0, Number(L.bottom) || 0);
     // 预留右侧面板宽度，避免范围被侧栏挡住
-    const usableW = Math.max(360, window.innerWidth - 380);
-    const usable = Math.min(usableW, window.innerHeight - 80);
+    const panelW = state.hidden ? 44 : state.panel === "detail" ? 648 : state.panel === "list" ? 372 : 552;
+    const usableW = Math.max(360, window.innerWidth - panelW);
+    const usableH = Math.max(240, window.innerHeight - padTop - padBottom);
+    const usable = Math.min(usableW, usableH);
     const metersPerPixel = (state.roi.radius * 2 * 1.25) / usable;
     const raw = Math.log2((156543.03392 * Math.cos((state.roi.center[1] * Math.PI) / 180)) / metersPerPixel);
     const zoom = Math.max(4, Math.min(18, Math.round(raw * 100) / 100));
     const [clng, clat] = geo.wgs84ToGcj02(state.roi.center[0], state.roi.center[1]);
     window.postMessage({ __xat: "ui", type: "fit", center: [clng, clat], zoom }, "*");
     log.info("请求缩放到搜索范围", { zoom, metersPerPixel: Math.round(metersPerPixel) });
+  }
+
+  /** 只有「目的地变了」才自动缩放，拖半径滑杆时不要跳地图 */
+  function maybeFitToDests() {
+    if (!state.hookReady || !state.roi || !state.dests.length) return;
+    const key = state.dests.map((d) => Number(d.lng).toFixed(4) + "," + Number(d.lat).toFixed(4)).join("|");
+    if (key === lastFitKey) return;
+    lastFitKey = key;
+    fitToRoi();
   }
 
   function markHookReady(info, via) {
@@ -885,7 +1525,7 @@
     reportDiag({ hookReady: true, zoom: info && info.zoom, center: info && info.center, via, href: location.href });
     log.info("地图挂钩就绪", { via, zoom: info && info.zoom, center: info && info.center, rect: info && info.rect });
     requestProjection();
-    setTimeout(fitToRoi, 400);
+    setTimeout(maybeFitToDests, 400);
   }
 
   function setStatus(kind, text) {
@@ -902,15 +1542,43 @@
     if (!act) return;
     const a = act.dataset.act;
     if (a === "edit") setPanel("edit");
-    if (a === "cancel-edit") { setPanel("list"); recomputeAndRender(); }
+    if (a === "cancel-edit") {
+      setPanel("list");
+      recomputeAndRender();
+    }
     if (a === "close-detail") closeDetail();
     if (a === "open-options") chrome.runtime.sendMessage({ type: "xat.openOptions" });
+    if (a === "add-dest") {
+      const s = state.settings;
+      if (s.destinations.length >= MAX_DESTS) {
+        toast(`最多 ${MAX_DESTS} 个目的地`);
+        return;
+      }
+      s.destinations.push({ id: "d" + Date.now().toString(36), name: "", lng: null, lat: null, mode: "drive" });
+      s.destinationCount = s.destinations.length;
+      renderEdit();
+      const inputs = $$("[data-dname]");
+      const last = inputs[inputs.length - 1];
+      if (last) last.focus();
+    }
+    if (a === "new-community") openCommunityForm(null);
+    if (a === "edit-community") openCommunityForm(state.selected);
+    if (a === "cancel-form") {
+      state.form = null;
+      setPanel("list");
+      requestProjection();
+    }
+    if (a === "form-save") saveForm();
+    if (a === "form-delete") deleteForm();
     if (a === "save") {
       rpc("settings.set", { patch: state.settings })
-        .then(() => {
+        .then((saved) => {
+          state.settings = saved;
+          applyLayout();
           log.info("设置已保存");
           setPanel("list");
           recomputeAndRender();
+          toast("已保存");
         })
         .catch((err) => log.error("保存设置失败", { error: String(err) }));
     }
@@ -942,9 +1610,13 @@
   });
 
   $(".side-handle").addEventListener("click", () => {
-    state.hidden = !state.hidden;
-    side.classList.toggle("is-hidden", state.hidden);
-    $(".side-handle").textContent = state.hidden ? "‹" : "›";
+    setDrawerVisible(false);
+    requestProjection();
+  });
+
+  drawer.addEventListener("click", () => {
+    setDrawerVisible(true);
+    requestProjection();
   });
 
   pill.addEventListener("click", () => {
@@ -957,7 +1629,10 @@
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
     if (state.panel === "detail") closeDetail();
-    else if (state.panel === "edit") setPanel("list");
+    else if (state.panel === "form") {
+      state.form = null;
+      setPanel("list");
+    } else if (state.panel === "edit") setPanel("list");
   });
 
   // 地图点悬停 / 点击（canvas 是 pointer-events:none，用坐标命中）
@@ -979,7 +1654,7 @@
           tooltip.style.top = e.clientY + "px";
           tooltip.innerHTML = `<b>${esc(r.name)}</b><br />` +
             r.mins.map((m, di) => `${DIGITS[di]} <span class="num">~${m}</span> 分`).join(" · ") +
-            `<br /><span class="num">${r.avgPrice.toLocaleString()}</span> 元/㎡ · <span class="num">${r.total}</span> 万` +
+            `<br /><span class="num">${fmtPrice(r.avgPrice)}</span> 元/㎡ · <span class="num">${fmtTotal(r.total)}</span>` +
             `<span class="tooltip__hint">点击查看详情</span>`;
         }
         draw();
@@ -1021,20 +1696,20 @@
       log.info("已读取本地数据", {
         ms: Date.now() - t0,
         communities: data.communities.length,
+        destinations: (data.settings.destinations || []).length,
         version: data.version,
         radiusKm: data.settings.radiusKm,
       });
       state.settings = data.settings;
       state.communities = data.communities;
-      if (!state.communities.length) {
-        log.warn("小区库为空，尝试重置样例数据");
-        state.communities = await rpc("seed.reset");
-      }
     } catch (e) {
       log.error("读取数据失败", { error: String(e) });
       setStatus("bad", "读取本地数据失败");
       return;
     }
+
+    applyLayout();
+    setDrawerVisible(!state.hidden);   // 默认折叠，只留右边缘抽屉
 
     compute();
     render();

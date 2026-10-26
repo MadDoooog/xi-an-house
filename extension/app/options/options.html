@@ -105,22 +105,30 @@
   <h2>数据 <small>只存在本机 IndexedDB，不上传</small></h2>
   <div class="card">
     <div class="row">
-      <button class="btn btn--xs" id="btn-seed">重置为样例数据</button>
+      <button class="btn btn--xs" id="btn-import">导入 JSON / GeoJSON</button>
       <button class="btn btn--xs" id="btn-export">导出全部数据</button>
+      <button class="btn btn--xs" id="btn-clear">清空小区库</button>
+      <input type="file" id="file-import" accept=".json,application/json,application/geo+json" hidden />
     </div>
-    <p class="hint">重置会清空当前小区库并写回 12 条西安样例（用于验证链路，不是真实市场数据）。</p>
+    <p class="hint">
+      支持的格式：本页导出的 JSON、后端 <code>/api/communities/geojson</code> 的 GeoJSON、或小区数组。
+      同名且 200 米内的记录会当作重复跳过，不会覆盖你手录的数据。
+    </p>
   </div>
 
   <h2>当前版本做了什么、没做什么</h2>
   <div class="card">
     <ul class="todo">
       <li>✅ 注入高德地图页，hook 到 <code>AMap.Map</code> 实例（拿到实例才有像素投影）</li>
-      <li>✅ canvas 叠加：搜索范围圆（外接圆 + 扩展半径）、目的地 pin、小区点（按最长通勤分档）</li>
-      <li>✅ 侧边栏：条件摘要 / 泳道刻度尺 / 列表 / 两列详情 / 条件编辑</li>
-      <li>✅ 日志与诊断（本页）</li>
-      <li>🟡 通勤时长目前是<b>直线估算</b>（数字前带 ~）</li>
+      <li>✅ 默认干净状态：不预置任何小区与目的地，侧栏默认折叠为右侧抽屉标签</li>
+      <li>✅ 侧栏上下留白可调（躲开高德自带工具条），折叠/展开状态保留</li>
+      <li>✅ 右键菜单「复制地址（西接通勤）」：地址文本 + WGS84 坐标写进剪贴板</li>
+      <li>✅ 地址输入框粘贴即可定位（带坐标直接读，纯文字走页面自带的 geocoder）</li>
+      <li>✅ 小区手录 / 编辑 / 删除 + JSON / GeoJSON 导入</li>
+      <li>✅ canvas 叠加：搜索范围圆（外接圆 + 扩展半径）、目的地 pin、小区点分档着色</li>
+      <li>🟡 通勤时长仍是<b>直线估算</b>（数字前带 ~）</li>
       <li>🟡 「去高德算」会用深链打开高德路线页，但<b>还没读回</b>时长（阶段 3d）</li>
-      <li>⬜ 地址搜索 / 新目的地选点</li>
+      <li>⬜ 预算 / 面积筛选滑块</li>
       <li>⬜ 自动发现小区（失去 API key 后改方案，暂缓）</li>
       <li>⬜ 卫星影像与边界绘制</li>
     </ul>

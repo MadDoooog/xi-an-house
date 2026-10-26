@@ -183,11 +183,29 @@ $("#btn-logs-clear").addEventListener("click", async () => {
   toast("日志已清空");
 });
 
-$("#btn-seed").addEventListener("click", async () => {
-  if (!confirm("重置为样例数据？当前小区库会被覆盖。")) return;
-  await rpc("seed.reset");
+$("#btn-import").addEventListener("click", () => $("#file-import").click());
+
+$("#file-import").addEventListener("change", async (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const payload = JSON.parse(text);
+    const res = await rpc("data.import", { payload });
+    toast(`导入完成：新增 ${res.added}，跳过重复 ${res.skipped}`);
+    await refreshStatus();
+  } catch (err) {
+    toast("导入失败：" + (err && err.message ? err.message : err));
+  } finally {
+    e.target.value = "";
+  }
+});
+
+$("#btn-clear").addEventListener("click", async () => {
+  if (!confirm("清空本机小区库？此操作不可撤销，建议先导出备份。")) return;
+  await rpc("data.reset");
   await refreshStatus();
-  toast("已重置为样例数据");
+  toast("小区库已清空");
 });
 
 $("#btn-export").addEventListener("click", async () => {

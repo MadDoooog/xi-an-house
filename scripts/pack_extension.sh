@@ -27,10 +27,27 @@ cp -R "$APP"/. "$STAGE/$NAME"/
 find "$STAGE/$NAME" -name '.DS_Store' -delete 2>/dev/null || true
 find "$STAGE/$NAME" -name '*.map' -delete 2>/dev/null || true
 
-( cd "$STAGE" && zip -qr "$ZIP" "$NAME" )
+( cd "$STAGE" && python3 - "$ZIP" "$NAME" <<'PY'
+import os, sys, zipfile
+
+zip_path, top = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    for root, _dirs, files in os.walk(top):
+        for f in sorted(files):
+            full = os.path.join(root, f)
+            z.write(full, os.path.relpath(full, "."))
+print("zipped", zip_path)
+PY
+)
 
 echo "已生成：$ZIP"
 echo "--- 包内清单 ---"
-unzip -l "$ZIP" | sed -n '1,40p'
+python3 - "$ZIP" <<'PY'
+import sys, zipfile
+
+with zipfile.ZipFile(sys.argv[1]) as z:
+    for info in z.infolist()[:40]:
+        print(f"{info.file_size:>9}  {info.filename}")
+PY
 echo
 echo "Windows 上解压到 D:\\ 之后，应存在：D:\\${NAME}\\manifest.json"

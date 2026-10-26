@@ -45,6 +45,29 @@ MapView (MapLibre) — OSM basemap default; Gaode optional toggle
 | `scripts/spike/` | Feasibility spikes; some logic ported into backend |
 | `spike_results/` | Local seed JSON/GeoJSON (gitignored; mounted in Docker) |
 
+## Browser extension (`extension/`) — separate sub-project
+
+A Chrome MV3 extension ("西接通勤") that injects a sidebar onto `https://www.amap.com/*`. It is a **parallel** deliverable: no build step, no server dependency, all data in the extension's own IndexedDB. Docs live in `docs/extension/` (`01-plan.md`, `02-ui.md`, `03-mvp.md`, `data-dictionary.md`).
+
+| Path | Purpose |
+|------|---------|
+| `extension/app/` | The loadable extension root (`manifest.json` at top level) |
+| `extension/app/background.js` | Service worker: IndexedDB (`settings` / `communities` / `logs` / `diag`), RPC hub, opens tabs |
+| `extension/app/content/map-hook.js` | MAIN world: hooks `AMap.Map`, projects points, right-click menu item, geocoding |
+| `extension/app/content/ui.js` | ISOLATED world: Shadow-DOM sidebar, canvas overlay, forms |
+| `extension/app/lib/geo.js` | WGS84 ↔ GCJ-02, haversine, MEC, straight-line commute estimate |
+| `extension/app/options/` | Settings/diagnostics page: logs, data import/export |
+| `extension/prototype/` | Static clickable UI prototype (design reference only) |
+
+Rules that matter when editing it:
+
+- **Storage is WGS84.** Everything persisted/compared is WGS84; convert to GCJ-02 only when talking to Amap (projection, deep links, right-click copy output).
+- **No preloaded data.** Default state is an empty library; sample data was removed in v0.2.0 (DB `onupgradeneeded` cleans old installs). Do not reintroduce seed rows.
+- **Sidebar is collapsed by default** (`state.hidden = true`) and uses `--xat-inset-top/bottom` CSS vars so it can dodge Amap's own toolbars.
+- **The right-click item is injected into Amap's own menu** (`ul.context_menu > li.menu_item`, cloned node) with a self-drawn fallback plus a DOM `contextmenu` + `containerToLngLat` path. Amap's menu renders lazily — keep the poll/upgrade logic.
+- **No remote code** (MV3 CSP): everything is bundled; no CDN.
+- Package with `bash scripts/pack_extension.sh` → `dist/xian-commute-ext-v<ver>.zip` (unzips to `xian-commute-ext/`; bump `manifest.json` version first).
+
 ## Boundary resolution (critical)
 
 Default provider: **`BOUNDARY_PROVIDER=osm`**.

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "西接通勤 · 通勤找房",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "在高德地图上叠加你收录的小区，通勤交给高德自己算。数据只存本机，不上传。",
   "minimum_chrome_version": "111",
   "permissions": [
