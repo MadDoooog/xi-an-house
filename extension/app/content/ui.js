@@ -65,6 +65,8 @@
     form: null,          // 正在编辑的小区
     formIsNew: false,
     geoSeq: 0,
+    sat: {},             // 小区影像缓存：id -> imagery.community 结果
+    scan: null,          // 大圆影像扫描结果
   };
 
   /* ---------------- 工具 ---------------- */
@@ -94,6 +96,13 @@
         reject(e);
       }
     });
+  }
+
+  /** 安全写 innerHTML：面板/标签切换的瞬间目标节点可能已经被替换掉 */
+  function setHtml(sel, html) {
+    const el = $(sel);
+    if (el) el.innerHTML = html;
+    return el;
   }
 
   function reportDiag(patch) {
@@ -303,11 +312,11 @@
       </div>
 
       <div class="tabpane" data-tabpane="discover" hidden>
-        <div class="placeholder">
-          <div class="placeholder__t">自动发现暂缓</div>
-          <div class="placeholder__d">原来的"圈内找小区"依赖高德 Web 服务 API（要 key）。
-            改用免 key 方案后，这一块暂缓，先靠人工录入与后端导入。<br /><br />
-            想现在就试：去高德搜"小区"，人工挑几个录进来。</div>
+        <div class="scan">
+          <p class="hint" style="margin-top:10px">把搜索范围（大圆）里的卫星图抓下来，<b>先二值化，再挑出片状的阴影块</b>（够大、够成型），
+            碎影和细线不算。机器结果只做参考，看图后点「像小区 / 不像」。</p>
+          <button class="btn btn--primary btn--xs" data-act="scan-roi">扫描大圆影像</button>
+          <div id="xat-scan-out"></div>
         </div>
       </div>
 
@@ -641,7 +650,12 @@
     const built = Number(r.buildYear) > 0 ? `${r.buildYear} 年 · 房龄 ${new Date().getFullYear() - r.buildYear} 年` : null;
 
     $("#xat-dbody").innerHTML = `
-      <div class="detail__thumb"><div><b>卫星影像</b>待接入天地图 tk<br />用来核对"这真的是住宅小区吗"</div></div>
+      <div class="sat" id="xat-dsat"><div class="sat__ph">卫星影像加载中…</div></div>
+
+      <div class="cblock">
+        <div class="cblock__title">影像粗判（机器参考，需人工核对）</div>
+        <div id="xat-dsat-metrics"><p class="hint" style="margin-top:0">等影像…</p></div>
+      </div>
 
       <div class="cblock">
         <div class="cblock__title">通勤（${state.dests.length} 个目的地 · 估算）</div>
@@ -680,6 +694,187 @@
     `;
 
     $$("[data-goto]").forEach((b) => b.addEventListener("click", () => gotoAmap(Number(b.dataset.goto))));
+    loadCommunitySat(r);
+  }
+
+  /* ---------------- 卫星影像：详情图 + 大圆扫描 ---------------- */
+
+  function verdictLabel(v) {
+    if (v === "like") return "像小区";
+    if (v === "dislike") return "不像";
+    if (v === "ignore") return "忽略";
+    return "未判定";
+  }
+
+  function verdictButtons(tile, verdicts) {
+    if (!tile) return `<p class="hint">没有可判定的瓦片。</p>`;
+    const cur = (verdicts && verdicts[tile.key]) || "";
+    const one = (v, txt) =>
+      `<button class="vbtn${cur === v ? " is-on" : ""}" data-act="sat-verdict" data-key="${esc(tile.key)}" data-v="${v}" data-cur="${cur}">${txt}</button>`;
+    return `<div class="sat__acts">${one("like", "像小区")}${one("dislike", "不像")}${one("ignore", "忽略")}
+      <span class="muted">当前：${verdictLabel(cur)}</span></div>`;
+  }
+
+  function centerTileOf(res, r) {
+    let best = null;
+    for (const t of res.tiles || []) {
+      const d = geo.haversine([r.lng, r.lat], t.center);
+      if (!best || d < best.d) best = { tile: t, d };
+    }
+    return best ? best.tile : null;
+  }
+
+  function renderSatInto(res, r) {
+    const box = $("#xat-dsat");
+    const metrics = $("#xat-dsat-metrics");
+    if (!box) return;
+    const agg = res.aggregate || {};
+    const center = centerTileOf(res, r);
+    setHtml("#xat-dsat", `
+      <img class="sat__img" src="${res.mosaic}" alt="卫星影像" />
+      <div class="sat__legend"><i></i>红 = 二值化后筛出的“片状阴影块”（够大、成型）；碎影/细线不算</div>
+    `);
+    if (metrics) {
+      setHtml("#xat-dsat-metrics", `
+        <div class="sat__metrics">
+          <div><b>${Math.round((agg.scoreMax || 0) * 100)}</b><span>粗分 / 100</span></div>
+          <div><b>${agg.patchesTotal || 0}</b><span>片状阴影块</span></div>
+          <div><b>${Math.round((agg.patchAreaM2Sum || 0) / 1000)}</b><span>片状面积千㎡</span></div>
+          <div><b>${Math.round(agg.maxPatchM2 || 0)}</b><span>最大块 ㎡</span></div>
+        </div>
+        <p class="hint">z${res.zoom} · ${res.tiles.length} 张瓦片 · 暗区 ${Math.round((agg.darkRatioMean || 0) * 100)}% · 绿化 ${Math.round((agg.greenRatioMean || 0) * 100)}% · 水面 ${Math.round((agg.waterRatioMean || 0) * 100)}%</p>
+        ${verdictButtons(center, res.verdicts)}
+        <p class="hint">机器只看“片状阴影块”，会漏也会误；最终以你看到的图为准。</p>
+      `);
+    }
+  }
+
+  async function loadCommunitySat(r) {
+    const key = "c:" + r.id;
+    const box = $("#xat-dsat");
+    if (!box) return;
+    if (state.sat[key]) {
+      renderSatInto(state.sat[key], r);
+      return;
+    }
+    box.innerHTML = `<div class="sat__ph">卫星影像加载中…（3×3 瓦片）</div>`;
+    const metrics = $("#xat-dsat-metrics");
+    if (metrics) metrics.innerHTML = `<p class="hint" style="margin-top:0">等影像…</p>`;
+    try {
+      const res = await rpc("imagery.community", { lng: r.lng, lat: r.lat });
+      state.sat[key] = res;
+      if (state.selected !== r.id) return;
+      renderSatInto(res, r);
+    } catch (e) {
+      box.innerHTML = `<div class="sat__ph sat__ph--bad">影像取不到：${esc(e.message || e)}</div>`;
+      log.warn("卫星影像失败", { error: String(e) });
+    }
+  }
+
+  async function startScan() {
+    const roi = state.roi;
+    if (!roi) {
+      toast("先设目的地，才有搜索范围");
+      return;
+    }
+    state.scan = { loading: true };
+    state.tab = "discover";
+    renderDiscover();
+    try {
+      const res = await rpc("imagery.area", {
+        lng: roi.center[0],
+        lat: roi.center[1],
+        radiusM: Math.min(3000, Math.max(150, roi.radius)),
+        maxTiles: 25,
+      });
+      state.scan = Object.assign({}, res, { loading: false, at: Date.now() });
+      renderDiscover();
+      toast(`扫描完成：${res.tiles.length} 张瓦片`);
+      log.info("大圆影像扫描完成", { zoom: res.zoom, tiles: res.tiles.length, failures: res.failures });
+    } catch (e) {
+      state.scan = { error: String(e.message || e) };
+      renderDiscover();
+      log.error("大圆影像扫描失败", { error: String(e) });
+    }
+  }
+
+  function renderDiscover() {
+    const out = $("#xat-scan-out");
+    if (!out) return;
+    const s = state.scan;
+    if (!s) {
+      out.innerHTML = `<p class="hint">还没扫描。点上面的按钮会抓 20–25 张瓦片并分析；首次约 10–20 秒，之后走本机缓存。</p>`;
+      return;
+    }
+    if (s.loading) {
+      out.innerHTML = `<div class="sat__ph">正在抓瓦片并分析…</div>`;
+      return;
+    }
+    if (s.error) {
+      out.innerHTML = `<div class="sat__ph sat__ph--bad">扫描失败：${esc(s.error)}</div>`;
+      return;
+    }
+    const agg = s.aggregate || {};
+    const tiles = (s.tiles || []).slice().sort((a, b) => b.score - a.score);
+    const rows = tiles
+      .slice(0, 8)
+      .map((t) => {
+        const cur = (s.verdicts || {})[t.key] || "";
+        const btn = (v, txt) =>
+          `<button class="vbtn${cur === v ? " is-on" : ""}" data-act="sat-verdict" data-key="${esc(t.key)}" data-v="${v}" data-cur="${cur}">${txt}</button>`;
+        return `<li class="scan-tile">
+          <div class="scan-tile__h">
+            <b class="scan-tile__s">${Math.round(t.score * 100)}</b>
+            <span class="num">${t.center[0].toFixed(4)}, ${t.center[1].toFixed(4)}</span>
+            <span class="badge badge--none">${t.feats.patches || 0} 片状影 · ${Math.round(t.feats.maxPatchM2 || 0)}㎡</span>
+          </div>
+          <div class="scan-tile__acts">
+            ${btn("like", "像小区")}${btn("dislike", "不像")}${btn("ignore", "忽略")}
+            <button class="vbtn vbtn--add" data-act="adopt-tile" data-key="${esc(t.key)}">加为小区</button>
+          </div>
+        </li>`;
+      })
+      .join("");
+    setHtml("#xat-scan-out", `
+      <img class="sat__img" src="${s.mosaic}" alt="搜索范围卫星影像" />
+      <div class="sat__legend"><i></i>红 = 片状阴影块 · 粗分均值 ${Math.round((agg.scoreMean || 0) * 100)} / 最高 ${Math.round((agg.scoreMax || 0) * 100)} · 片状块合计 ${agg.patchesTotal || 0}</div>
+      <p class="hint">z${s.zoom} · 实际覆盖半径 ${(s.radiusM / 1000).toFixed(2)} km${s.clipped ? `（搜索半径 ${(s.requestedRadiusM / 1000).toFixed(1)} km 太大，只扫了中心）` : ""} · ${s.tiles.length} 张瓦片${s.failures ? ` · ${s.failures} 张失败` : ""}</p>
+      <ul class="scan-list">${rows || `<li class="empty"><div class="empty__d">这一片没检出长影带。</div></li>`}</ul>
+      <p class="hint">按粗分排序的前 ${Math.min(8, tiles.length)} 张。判定会存本机；觉得对就点「加为小区」把它录进来。</p>
+    `);
+  }
+
+  async function setVerdict(key, v, cur) {
+    const next = cur === v ? "none" : v;
+    try {
+      const res = await rpc("imagery.verdict", { key, verdict: next });
+      const apply = (store) => {
+        if (!store) return;
+        if (!store.verdicts) store.verdicts = {};
+        if (res.verdict) store.verdicts[key] = res.verdict;
+        else delete store.verdicts[key];
+      };
+      apply(state.scan);
+      Object.keys(state.sat).forEach((k) => apply(state.sat[k]));
+      toast(next === "none" ? "已清除判定" : `已记下：${verdictLabel(next)}`);
+      if (state.panel === "detail") renderDetail();
+      if (state.tab === "discover") renderDiscover();
+    } catch (e) {
+      toast("记录失败：" + (e.message || e));
+    }
+  }
+
+  function adoptTile(key) {
+    const t = ((state.scan && state.scan.tiles) || []).find((x) => x.key === key);
+    if (!t) return;
+    openCommunityForm(null);
+    if (!state.form) return;
+    state.form.name = `影像候选 z${t.z}`;
+    state.form.lng = t.center[0];
+    state.form.lat = t.center[1];
+    state.form.sources = ["manual"];
+    renderForm();
+    toast("坐标已填好，改成真实小区名再保存");
   }
 
   function destRowHtml(d, i, total) {
@@ -1121,6 +1316,7 @@
     if (!f) return;
     try {
       const saved = await rpc("community.put", { community: f });
+      delete state.sat["c:" + saved.id];
       const i = state.communities.findIndex((c) => c.id === saved.id);
       if (i >= 0) state.communities[i] = saved;
       else state.communities.push(saved);
@@ -1150,6 +1346,7 @@
       return;
     }
     state.communities = state.communities.filter((c) => c.id !== f.id);
+    delete state.sat["c:" + f.id];
     if (state.selected === f.id) state.selected = null;
     state.form = null;
     setPanel("list");
@@ -1168,6 +1365,7 @@
   }
 
   function recomputeAndRender() {
+    state.scan = null;
     compute();
     render();
     requestProjection();
@@ -1562,6 +1760,9 @@
       if (last) last.focus();
     }
     if (a === "new-community") openCommunityForm(null);
+    if (a === "scan-roi") startScan();
+    if (a === "sat-verdict") setVerdict(act.dataset.key, act.dataset.v, act.dataset.cur || "");
+    if (a === "adopt-tile") adoptTile(act.dataset.key);
     if (a === "edit-community") openCommunityForm(state.selected);
     if (a === "cancel-form") {
       state.form = null;
@@ -1589,6 +1790,7 @@
       state.tab = btn.dataset.tab;
       $$(".tabs__btn").forEach((b) => b.classList.toggle("is-on", b === btn));
       $$(".tabpane").forEach((p) => (p.hidden = p.dataset.tabpane !== state.tab));
+      if (state.tab === "discover") renderDiscover();
     });
   });
 

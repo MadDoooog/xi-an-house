@@ -9,8 +9,11 @@
    ============================================================ */
 "use strict";
 
+// 纯函数影像分析（瓦片对齐、阈值、长暗带 PCA）
+importScripts("lib/imagery.js");
+
 const DB_NAME = "xat";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const LOG_LIMIT = 2000;
 
 /* 0.1.0 预置过的虚构样例：升级到 2 版时清掉，让老用户也回到干净状态 */
@@ -38,6 +41,8 @@ function openDb() {
       }
       if (!db.objectStoreNames.contains("diag")) db.createObjectStore("diag", { keyPath: "tabId" });
       if (!db.objectStoreNames.contains("commute")) db.createObjectStore("commute", { keyPath: "id" });
+      if (!db.objectStoreNames.contains("tiles")) db.createObjectStore("tiles", { keyPath: "key" });
+      if (!db.objectStoreNames.contains("verdicts")) db.createObjectStore("verdicts", { keyPath: "key" });
 
       // v1 → v2：去掉 0.1.0 的 12 条虚构样例 + 3 个虚构目的地
       if (ev.oldVersion >= 1 && ev.oldVersion < 2) {
@@ -317,6 +322,127 @@ async function addLogs(entries) {
 
 const bgLog = (level, msg, data) => addLogs([{ level, source: "bg", msg, data }]);
 
+/* ---------------- 卫星影像（高德瓦片，GCJ-02 对齐） ---------------- */
+
+const TILE_HOSTS = ["webst01", "webst02", "webst03", "webst04"];
+const TILE_PX = 256;
+
+function blobToDataUrl(blob) {
+  return blob.arrayBuffer().then((buf) => {
+    const bytes = new Uint8Array(buf);
+    let s = "";
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      s += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    return "data:" + (blob.type || "image/jpeg") + ";base64," + btoa(s);
+  });
+}
+
+/** 该 zoom 下、该纬度处 1 像素代表多少米（Web 墨卡托） */
+function metersPerPixel(zoom, lat) {
+  return (156543.03392 * Math.cos((lat * Math.PI) / 180)) / 2 ** zoom;
+}
+
+async function analyzeBlob(blob, mPerPx) {
+  const bmp = await createImageBitmap(blob);
+  const cv = new OffscreenCanvas(TILE_PX, TILE_PX);
+  const ctx = cv.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(bmp, 0, 0, TILE_PX, TILE_PX);
+  if (typeof bmp.close === "function") bmp.close();
+  const img = ctx.getImageData(0, 0, TILE_PX, TILE_PX);
+  return XAT_IMAGERY.analyzeRgba(img.data, TILE_PX, TILE_PX, { mPerPx });
+}
+
+/** 取一张卫星瓦片（带本地缓存），返回 {key, blob, feats, bandMask, cached} */
+async function getSatTile(z, x, y) {
+  const key = `${z}/${x}/${y}`;
+  const centerLat = XAT_IMAGERY.tileToLonLatFloat(x + 0.5, y + 0.5, z)[1];
+  const mPerPx = metersPerPixel(z, centerLat);
+  const cached = await idb.get("tiles", key).catch(() => null);
+  if (cached && cached.blob) {
+    const analysis = await analyzeBlob(cached.blob, mPerPx);
+    return { key, z, x, y, blob: cached.blob, feats: analysis.features, bandMask: analysis.bandMask, cached: true };
+  }
+  const host = TILE_HOSTS[Math.abs(x + y) % TILE_HOSTS.length];
+  const url = `https://${host}.is.autonavi.com/appmaptile?style=6&x=${x}&y=${y}&z=${z}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`瓦片 ${z}/${x}/${y} HTTP ${res.status}`);
+  const blob = await res.blob();
+  const analysis = await analyzeBlob(blob, mPerPx);
+  await idb.put("tiles", { key, z, x, y, blob, feats: analysis.features, at: Date.now() });
+  return { key, z, x, y, blob, feats: analysis.features, bandMask: analysis.bandMask, cached: false };
+}
+
+/** 把瓦片拼成一张图；长暗带用半透明红色叠上去，方便人眼核对 */
+async function composeMosaic(entries, cols, rows) {
+  const W = cols * TILE_PX;
+  const H = rows * TILE_PX;
+  const base = new OffscreenCanvas(W, H);
+  const ctx = base.getContext("2d", { willReadFrequently: true });
+  for (const e of entries) {
+    const bmp = await createImageBitmap(e.blob);
+    ctx.drawImage(bmp, e.col * TILE_PX, e.row * TILE_PX, TILE_PX, TILE_PX);
+    if (typeof bmp.close === "function") bmp.close();
+  }
+  for (const e of entries) {
+    if (!e.bandMask) continue;
+    const dx = e.col * TILE_PX;
+    const dy = e.row * TILE_PX;
+    const img = ctx.getImageData(dx, dy, TILE_PX, TILE_PX);
+    const d = img.data;
+    const m = e.bandMask;
+    for (let y = 0; y < TILE_PX; y += 1) {
+      for (let x = 0; x < TILE_PX; x += 1) {
+        const i = y * TILE_PX + x;
+        if (!m[i]) continue;
+        const o = i * 4;
+        // 1 像素描边：暗部里也能看出"这里标了"
+        const edge =
+          x === 0 || y === 0 || x === TILE_PX - 1 || y === TILE_PX - 1 ||
+          !m[i - 1] || !m[i + 1] || !m[i - TILE_PX] || !m[i + TILE_PX];
+        if (edge) {
+          d[o] = 255;
+          d[o + 1] = 46;
+          d[o + 2] = 32;
+        } else {
+          d[o] = Math.round(0.6 * 226 + 0.4 * d[o]);
+          d[o + 1] = Math.round(0.6 * 56 + 0.4 * d[o + 1]);
+          d[o + 2] = Math.round(0.6 * 40 + 0.4 * d[o + 2]);
+        }
+      }
+    }
+    ctx.putImageData(img, dx, dy);
+  }
+  const maxW = 720;
+  const scale = Math.min(1, maxW / W);
+  const outW = Math.max(64, Math.round(W * scale));
+  const outH = Math.max(64, Math.round(H * scale));
+  const out = new OffscreenCanvas(outW, outH);
+  const octx = out.getContext("2d");
+  octx.drawImage(base, 0, 0, outW, outH);
+  const blob = await out.convertToBlob({ type: "image/jpeg", quality: 0.72 });
+  return { dataUrl: await blobToDataUrl(blob), width: outW, height: outH };
+}
+
+function aggregateTiles(tiles) {
+  if (!tiles.length) return null;
+  const feats = tiles.map((t) => t.feats || {});
+  const avg = (fn) => feats.reduce((s, f) => s + (fn(f) || 0), 0) / feats.length;
+  return {
+    scoreMean: avg((f) => f.score),
+    scoreMax: Math.max.apply(null, feats.map((f) => f.score || 0)),
+    darkRatioMean: avg((f) => f.darkRatio),
+    greenRatioMean: avg((f) => f.greenRatio),
+    waterRatioMean: avg((f) => f.waterRatio),
+    patchesTotal: feats.reduce((s, f) => s + (f.patches || 0), 0),
+    patchAreaM2Sum: feats.reduce((s, f) => s + (f.patchAreaM2 || 0), 0),
+    maxPatchM2: feats.reduce((s, f) => Math.max(s, f.maxPatchM2 || 0), 0),
+    meanFill: feats.length ? feats.reduce((s, f) => s + (f.meanFill || 0), 0) / feats.length : 0,
+    tiles: tiles.length,
+  };
+}
+
 /* ---------------- RPC ---------------- */
 
 const handlers = {
@@ -398,6 +524,99 @@ const handlers = {
     await idb.clear("communities");
     await bgLog("warn", "小区库已清空");
     return { ok: true, communities: [] };
+  },
+
+  /**
+   * 抓一片区域的卫星图并算特征。
+   * 高德影像瓦片是 GCJ-02 对齐的，所以取瓦片前把 WGS84 换成 GCJ-02。
+   */
+  async "imagery.area"({ lng, lat, radiusM = 1200, maxTiles = 25 } = {}) {
+    if (!Number.isFinite(lng) || !Number.isFinite(lat)) throw new Error("缺少坐标");
+    const I = XAT_IMAGERY;
+    const requested = Math.max(60, Math.min(6000, Number(radiusM) || 1200));
+    const cap = Math.max(1, Math.min(49, Number(maxTiles) || 25));
+    // 不低于 z16：z15 及更粗时楼影已经看不出来了，宁可缩小覆盖范围
+    const zoom = I.pickZoom(requested, cap, 16);
+    const r = Math.min(requested, I.radiusForTiles(zoom, cap));
+    const list = I.tilesForCircle(lng, lat, r, zoom);
+    const x1 = Math.min.apply(null, list.map((t) => t.x));
+    const x2 = Math.max.apply(null, list.map((t) => t.x));
+    const y1 = Math.min.apply(null, list.map((t) => t.y));
+    const y2 = Math.max.apply(null, list.map((t) => t.y));
+
+    const verdictRows = await idb.getAll("verdicts").catch(() => []);
+    const vmap = {};
+    verdictRows.forEach((v) => { vmap[v.key] = v.verdict; });
+
+    const fetched = [];
+    let failures = 0;
+    for (const t of list) {
+      try {
+        const tile = await getSatTile(t.z, t.x, t.y);
+        const center = I.tileToLonLatFloat(t.x + 0.5, t.y + 0.5, t.z);
+        const wgs = I.gcj02ToWgs84(center[0], center[1]);
+        fetched.push({ ...tile, col: t.x - x1, row: t.y - y1, center: wgs });
+      } catch (e) {
+        failures += 1;
+        await bgLog("warn", "瓦片获取失败", { tile: `${t.z}/${t.x}/${t.y}`, error: String(e) });
+      }
+      await new Promise((res) => setTimeout(res, 40));
+    }
+    if (!fetched.length) throw new Error("一张瓦片都没取到（检查网络，或高德域名是否可访问）");
+
+    const mosaic = await composeMosaic(fetched, x2 - x1 + 1, y2 - y1 + 1);
+    const tiles = fetched.map((f) => ({
+      key: f.key,
+      z: f.z,
+      x: f.x,
+      y: f.y,
+      center: f.center,
+      score: f.feats.score,
+      feats: f.feats,
+      verdict: vmap[f.key] || null,
+      cached: !!f.cached,
+    }));
+    const aggregate = aggregateTiles(tiles);
+    await bgLog("info", "卫星影像分析完成", { zoom, tiles: tiles.length, failures, scoreMean: aggregate.scoreMean });
+    return {
+      zoom,
+      radiusM: r,
+      requestedRadiusM: requested,
+      clipped: r < requested - 1,
+      tiles,
+      aggregate,
+      mosaic: mosaic.dataUrl,
+      mosaicSize: [mosaic.width, mosaic.height],
+      bounds: { x1, x2, y1, y2 },
+      failures,
+      verdicts: vmap,
+    };
+  },
+
+  /** 一个小区点位的小范围影像（z18，3×3 瓦片 ≈ 380 m 见方） */
+  async "imagery.community"({ lng, lat } = {}) {
+    return handlers["imagery.area"]({ lng, lat, radiusM: 170, maxTiles: 9 });
+  },
+
+  /** 人工判定：like / dislike / ignore / none（清除） */
+  async "imagery.verdict"({ key, verdict }) {
+    if (!key) throw new Error("缺少瓦片 key");
+    const v = String(verdict || "none");
+    if (v === "none") await idb.del("verdicts", key);
+    else await idb.put("verdicts", { key, verdict: v, at: Date.now() });
+    await bgLog("info", "影像判定已记录", { key, verdict: v });
+    return { key, verdict: v === "none" ? null : v };
+  },
+
+  async "imagery.cache"() {
+    const all = await idb.getAll("tiles").catch(() => []);
+    return { count: all.length, bytes: all.reduce((s, t) => s + (t.blob ? t.blob.size : 0), 0) };
+  },
+
+  async "imagery.clear"() {
+    await idb.clear("tiles");
+    await bgLog("warn", "卫星瓦片缓存已清空");
+    return { ok: true };
   },
 
   async "log.add"({ entries }) {
