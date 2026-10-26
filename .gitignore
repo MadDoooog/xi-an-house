@@ -8,5 +8,5 @@ spike_results/
 frontend/node_modules/
 frontend/dist/
 .DS_Store
-extension/tests/node_modules/
+extension/tests/node_modules
 extension/tests/out/
