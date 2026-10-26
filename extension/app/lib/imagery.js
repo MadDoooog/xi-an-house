@@ -128,7 +128,6 @@
     maxAspect: 8,
     // 打分时单块面积的封顶，避免一整片连着的大暗区把分数拉爆
     scoreAreaCapM2: 20000,
-    waterBlueDelta: 10,
     greenExg: 16,
   };
 
@@ -239,7 +238,6 @@
     const n = w * h;
     const lum = new Float32Array(n);
     const green = new Uint8Array(n);
-    const water = new Uint8Array(n);
     const hist = new Uint32Array(256);
     let urbanN = 0;
 
@@ -253,11 +251,7 @@
       const mn = Math.min(r, g, b);
       const S = mx === 0 ? 0 : (mx - mn) / mx;
       const exg = 2 * g - r - b;
-      // 水面：明显偏青蓝（b 比 g 也高），而不是"偏蓝的阴影"（阴影 b-g≈0）
-      if (b > r + 12 && b - g >= 4 && L < 110 && S > 0.18 && exg <= 2) {
-        water[i] = 1;
-        continue;
-      }
+      // 只分"绿化"；不做水面（西安水面少，暗块由人工纠错）
       if (exg > P.greenExg && L > 30) {
         green[i] = 1;
         continue;
@@ -270,7 +264,7 @@
     const dark = new Uint8Array(n);
     let darkCount = 0;
     for (let i = 0; i < n; i += 1) {
-      if (green[i] || water[i]) continue;
+      if (green[i]) continue;
       if (lum[i] <= thr) {
         dark[i] = 1;
         darkCount += 1;
@@ -285,7 +279,7 @@
     const urbanLum = [];
     const stride = Math.max(1, Math.round(Math.sqrt(n / 40000)));
     for (let i = 0; i < n; i += stride) {
-      if (green[i] || water[i]) continue;
+      if (green[i]) continue;
       urbanLum.push(lum[i]);
     }
     urbanLum.sort((a, b) => a - b);
@@ -344,11 +338,9 @@
     const roofThr = Math.min(245, medianL + 0.55 * (255 - medianL));
     let roofCount = 0;
     let greenCount = 0;
-    let waterCount = 0;
     for (let i = 0; i < n; i += 1) {
       greenCount += green[i];
-      waterCount += water[i];
-      if (green[i] || water[i]) continue;
+      if (green[i]) continue;
       if (lum[i] >= roofThr) roofCount += 1;
     }
 
@@ -367,7 +359,6 @@
       meanDarkF,
       roofRatio: roofCount / n,
       greenRatio: greenCount / n,
-      waterRatio: waterCount / n,
       imgAreaM2,
     };
     features.score = scoreOf(features);
@@ -386,7 +377,6 @@
     const darkS = Math.min(1, (f.meanDarkF || 0) / 0.5);
     const roofS = Math.min(1, (f.roofRatio || 0) / 0.15);
     let s = 0.32 * areaS + 0.2 * maxS + 0.14 * cntS + 0.12 * fillS + 0.12 * darkS + 0.1 * roofS;
-    if (f.waterRatio > 0.25) s *= 0.35;
     if (f.greenRatio > 0.62 && (f.patches || 0) < 2) s *= 0.5;
     return Math.max(0, Math.min(1, s));
   }

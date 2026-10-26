@@ -434,7 +434,6 @@ function aggregateTiles(tiles) {
     scoreMax: Math.max.apply(null, feats.map((f) => f.score || 0)),
     darkRatioMean: avg((f) => f.darkRatio),
     greenRatioMean: avg((f) => f.greenRatio),
-    waterRatioMean: avg((f) => f.waterRatio),
     patchesTotal: feats.reduce((s, f) => s + (f.patches || 0), 0),
     patchAreaM2Sum: feats.reduce((s, f) => s + (f.patchAreaM2 || 0), 0),
     maxPatchM2: feats.reduce((s, f) => Math.max(s, f.maxPatchM2 || 0), 0),

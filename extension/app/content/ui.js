@@ -742,7 +742,7 @@
           <div><b>${Math.round((agg.patchAreaM2Sum || 0) / 1000)}</b><span>片状面积千㎡</span></div>
           <div><b>${Math.round(agg.maxPatchM2 || 0)}</b><span>最大块 ㎡</span></div>
         </div>
-        <p class="hint">z${res.zoom} · ${res.tiles.length} 张瓦片 · 暗区 ${Math.round((agg.darkRatioMean || 0) * 100)}% · 绿化 ${Math.round((agg.greenRatioMean || 0) * 100)}% · 水面 ${Math.round((agg.waterRatioMean || 0) * 100)}%</p>
+        <p class="hint">z${res.zoom} · ${res.tiles.length} 张瓦片 · 暗区 ${Math.round((agg.darkRatioMean || 0) * 100)}% · 绿化 ${Math.round((agg.greenRatioMean || 0) * 100)}%</p>
         ${verdictButtons(center, res.verdicts)}
         <p class="hint">机器只看“片状阴影块”，会漏也会误；最终以你看到的图为准。</p>
       `);
