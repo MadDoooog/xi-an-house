@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<style>
+  body {
+    margin: 0; width: 300px; background: #f4f1e9; color: #1a1815;
+    font: 400 12px/1.55 "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  .head {
+    display: flex; align-items: baseline; gap: 8px;
+    padding: 12px 14px 9px; background: #eae5d9; border-bottom: 1px solid #c3bba8;
+  }
+  .head b { font: 600 15px/1 "Songti SC", "SimSun", serif; letter-spacing: .14em; }
+  .head span { font-size: 10.5px; color: #8c8578; }
+  .body { padding: 12px 14px; }
+  .kv { display: flex; gap: 8px; font-size: 11.5px; margin-bottom: 5px; }
+  .kv i { font-style: normal; color: #8c8578; min-width: 62px; }
+  .kv em { font-style: normal; font-family: ui-monospace, Consolas, monospace; }
+  .ok { color: #126e5b; } .bad { color: #9c2a22; } .warn { color: #b9852b; }
+  .row { display: flex; gap: 6px; margin-top: 10px; }
+  button {
+    flex: 1; font: 500 11.5px/1 inherit; padding: 7px 8px;
+    border: 1px solid #c3bba8; background: #fff; cursor: pointer;
+  }
+  button.primary { background: #1a1815; border-color: #1a1815; color: #f4f1e9; font-weight: 600; }
+  p { margin: 8px 0 0; font-size: 10.5px; color: #8c8578; line-height: 1.6; }
+</style>
+</head>
+<body>
+  <div class="head"><b>西接通勤</b><span id="ver">v?</span></div>
+  <div class="body">
+    <div class="kv"><i>挂钩状态</i><em id="hook">—</em></div>
+    <div class="kv"><i>小区数据</i><em id="comms">—</em></div>
+    <div class="kv"><i>日志</i><em id="logs">—</em></div>
+    <div class="row">
+      <button class="primary" id="open">打开高德地图</button>
+    </div>
+    <div class="row">
+      <button id="diag">设置与诊断</button>
+    </div>
+    <p>侧栏在高德地图页的右侧。若没看到，先刷新高德页面，再来这里看「挂钩状态」。</p>
+  </div>
+<script src="popup.js"></script>
+</body>
+</html>

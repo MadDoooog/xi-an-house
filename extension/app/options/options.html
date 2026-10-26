@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>西接通勤 · 设置与诊断</title>
+<style>
+  :root {
+    --paper: #f4f1e9; --paper2: #eae5d9; --ink: #1a1815; --ink2: #5b544a;
+    --ink3: #8c8578; --rule: #d5cebe; --rule2: #c3bba8;
+    --seal: #9c2a22; --teal: #126e5b; --blue: #2e5f8a; --amber: #b9852b;
+    --num: ui-monospace, "SF Mono", Consolas, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--paper); color: var(--ink);
+    font: 400 13px/1.6 "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 26px 22px 60px; }
+  header { display: flex; align-items: baseline; gap: 10px; border-bottom: 1px solid var(--rule2); padding-bottom: 12px; }
+  h1 { margin: 0; font: 600 22px/1.2 "Songti SC", "SimSun", serif; letter-spacing: .12em; }
+  header span { color: var(--ink3); font-size: 12px; }
+  h2 { margin: 26px 0 8px; font: 600 15px/1.3 "Songti SC", "SimSun", serif; }
+  h2 small { font: 400 11px/1 sans-serif; color: var(--ink3); margin-left: 8px; letter-spacing: 0; }
+  p.hint { color: var(--ink3); font-size: 12px; margin: 6px 0 12px; line-height: 1.7; }
+  .card { background: #fff; border: 1px solid var(--rule); padding: 14px 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px 18px; }
+  .kv { display: flex; gap: 8px; align-items: baseline; font-size: 12px; }
+  .kv b { font-weight: 500; color: var(--ink3); min-width: 78px; }
+  .kv span { font-family: var(--num); }
+  .ok { color: var(--teal); } .bad { color: var(--seal); } .warn { color: var(--amber); }
+  .btn {
+    font: 500 12px/1 inherit; padding: 7px 12px; border: 1px solid var(--rule2);
+    background: #fff; color: var(--ink); cursor: pointer;
+  }
+  .btn:hover { border-color: var(--ink3); }
+  .btn--primary { background: var(--ink); border-color: var(--ink); color: var(--paper); font-weight: 600; }
+  .btn--xs { padding: 5px 9px; font-size: 11px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  select { padding: 6px 8px; border: 1px solid var(--rule2); background: #fff; font: inherit; }
+  #logs {
+    max-height: 420px; overflow: auto; background: #fff; border: 1px solid var(--rule);
+    font: 400 11.5px/1.55 var(--num); padding: 8px 10px;
+  }
+  .logline { display: flex; gap: 8px; padding: 2px 0; border-bottom: 1px dotted #eee7d8; white-space: pre-wrap; word-break: break-all; }
+  .logline .t { color: var(--ink3); flex: none; }
+  .logline .s { color: var(--blue); flex: none; min-width: 58px; }
+  .logline .m { flex: 1; }
+  .logline.debug .m { color: var(--ink3); }
+  .logline.warn .m { color: var(--amber); }
+  .logline.error .m { color: var(--seal); }
+  textarea { width: 100%; height: 140px; font: 400 11.5px/1.5 var(--num); border: 1px solid var(--rule2); padding: 8px; }
+  .toast {
+    position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+    background: var(--ink); color: var(--paper); padding: 9px 16px; font-size: 12px;
+    opacity: 0; transition: opacity .2s; pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+  ul.todo { margin: 6px 0 0; padding-left: 18px; color: var(--ink2); font-size: 12px; line-height: 1.8; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>西接通勤</h1>
+    <span>设置与诊断 · <span id="ver">v?</span></span>
+  </header>
+
+  <h2>状态自检 <small>先看这一块；如果是红的，把下面的诊断信息复制给我</small></h2>
+  <div class="card">
+    <div class="grid">
+      <div class="kv"><b>扩展版本</b><span id="d-ver">—</span></div>
+      <div class="kv"><b>小区数据</b><span id="d-comms">—</span></div>
+      <div class="kv"><b>日志条数</b><span id="d-logs">—</span></div>
+      <div class="kv"><b>挂钩状态</b><span id="d-hook">—</span></div>
+      <div class="kv"><b>最近页面</b><span id="d-url" style="word-break:break-all">—</span></div>
+      <div class="kv"><b>更新时间</b><span id="d-upd">—</span></div>
+    </div>
+    <p class="hint" style="margin-top:12px">
+      挂钩状态来自内容脚本：打开 <b>高德地图页面</b>（ditu.amap.com 或 www.amap.com 的主地图页）后，
+      左下角会出现一个状态胶囊；绿色表示已拿到地图实例、点已经画上去了。
+    </p>
+    <div class="row">
+      <button class="btn btn--primary" id="btn-copy">复制诊断信息</button>
+      <button class="btn" id="btn-refresh">刷新</button>
+      <button class="btn" id="btn-amap">打开高德地图</button>
+    </div>
+  </div>
+
+  <h2>运行日志 <small>所有关键步骤都会记录；排错靠它</small></h2>
+  <div class="row" style="margin-bottom:8px">
+    <select id="log-level">
+      <option value="debug">全部（含 debug）</option>
+      <option value="info" selected>info 及以上</option>
+      <option value="warn">只看 warn / error</option>
+      <option value="error">只看 error</option>
+    </select>
+    <button class="btn btn--xs" id="btn-logs-refresh">刷新</button>
+    <button class="btn btn--xs" id="btn-logs-export">导出 .txt</button>
+    <button class="btn btn--xs" id="btn-logs-export-json">导出 .json</button>
+    <button class="btn btn--xs" id="btn-logs-clear">清空</button>
+    <span class="hint" style="margin:0" id="log-count"></span>
+  </div>
+  <div id="logs"></div>
+
+  <h2>数据 <small>只存在本机 IndexedDB，不上传</small></h2>
+  <div class="card">
+    <div class="row">
+      <button class="btn btn--xs" id="btn-seed">重置为样例数据</button>
+      <button class="btn btn--xs" id="btn-export">导出全部数据</button>
+    </div>
+    <p class="hint">重置会清空当前小区库并写回 12 条西安样例（用于验证链路，不是真实市场数据）。</p>
+  </div>
+
+  <h2>当前版本做了什么、没做什么</h2>
+  <div class="card">
+    <ul class="todo">
+      <li>✅ 注入高德地图页，hook 到 <code>AMap.Map</code> 实例（拿到实例才有像素投影）</li>
+      <li>✅ canvas 叠加：搜索范围圆（外接圆 + 扩展半径）、目的地 pin、小区点（按最长通勤分档）</li>
+      <li>✅ 侧边栏：条件摘要 / 泳道刻度尺 / 列表 / 两列详情 / 条件编辑</li>
+      <li>✅ 日志与诊断（本页）</li>
+      <li>🟡 通勤时长目前是<b>直线估算</b>（数字前带 ~）</li>
+      <li>🟡 「去高德算」会用深链打开高德路线页，但<b>还没读回</b>时长（阶段 3d）</li>
+      <li>⬜ 地址搜索 / 新目的地选点</li>
+      <li>⬜ 自动发现小区（失去 API key 后改方案，暂缓）</li>
+      <li>⬜ 卫星影像与边界绘制</li>
+    </ul>
+  </div>
+
+  <h2>诊断信息（可直接复制给我）</h2>
+  <textarea id="diagbox" readonly></textarea>
+</div>
+<div class="toast" id="toast"></div>
+<script src="options.js"></script>
+</body>
+</html>
