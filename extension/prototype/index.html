@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>西接通勤 · 找房原型 v2（阶段 2 改版）</title>
+<link rel="stylesheet" href="prototype.css" />
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ================= 地图（全屏） ================= -->
+  <main class="mapwrap">
+    <canvas id="map"></canvas>
+
+    <div class="brand">
+      <span class="brand__name">西接通勤</span>
+      <button class="brand__gear" id="btnSettings" title="设置" aria-label="设置">⚙</button>
+    </div>
+
+    <div class="map-hud">
+      <button class="hud-btn" id="zoomIn" aria-label="放大">＋</button>
+      <button class="hud-btn" id="zoomOut" aria-label="缩小">－</button>
+      <button class="hud-btn" id="zoomFit" aria-label="回到全图">⤢</button>
+    </div>
+
+    <div class="legend">
+      <div class="legend__title">图例</div>
+      <div class="legend__row legend__ramp">
+        <span>最长通勤</span>
+        <i class="ramp"><b class="s1"></b><b class="s2"></b><b class="s3"></b><b class="s4"></b></i>
+        <span class="num">≤15 · 25 · 35 · 45+</span>
+      </div>
+      <div class="legend__row"><span class="sw sw--area"></span>已收录小区分布（点云派生）</div>
+      <div class="legend__row"><span class="sw sw--roi"></span>搜索范围（外接圆 + 扩展半径）</div>
+      <div class="legend__row"><span class="sw sw--mec"></span>目的地外接圆</div>
+      <div class="legend__row legend__dests" id="legendDests"></div>
+    </div>
+
+    <div class="scalebar">
+      <div class="scalebar__bar"></div>
+      <span class="num" id="scaleText">1 km</span>
+      <span class="scalebar__note">样例底图 · 非真实影像</span>
+    </div>
+
+    <div class="tooltip" id="tooltip" hidden></div>
+  </main>
+
+  <!-- ================= 右侧边栏 ================= -->
+  <aside class="side" id="side">
+
+    <!-- 第 1 行：条件摘要（始终一行） -->
+    <button class="condline" id="condLine" aria-label="编辑筛选条件">
+      <span class="condline__txt" id="condTxt">3 个目的地 · 半径 3 km · 150–300 万</span>
+      <span class="condline__edit">编辑</span>
+    </button>
+
+    <!-- 第 2 行：列表 / 发现 / 待补 -->
+    <section class="pane pane--list" data-pane="list">
+      <nav class="tabs" role="tablist">
+        <button class="tabs__btn is-on" data-tab="result" role="tab">结果<span class="tabs__n" id="nResult">8</span></button>
+        <button class="tabs__btn" data-tab="discover" role="tab">发现<span class="tabs__n" id="nDiscover">6</span></button>
+        <button class="tabs__btn" data-tab="gap" role="tab">待补<span class="tabs__n" id="nGap">3</span></button>
+      </nav>
+
+      <!-- 结果 -->
+      <div class="tabpane" data-tabpane="result">
+        <div class="lanes" id="lanes" aria-label="各目的地的通勤时间分布"></div>
+        <div class="lanes__axis" id="lanesAxis"></div>
+
+        <div class="listhead">
+          <span class="listhead__count"><span class="num" id="cIn">12</span> 在范围内 · <span class="num" id="cOK">8</span> 符合过滤</span>
+          <div class="seg seg--sm" role="group" aria-label="排序">
+            <button class="seg__btn is-on" data-sort="commute">通勤</button>
+            <button class="seg__btn" data-sort="total">总价</button>
+            <button class="seg__btn" data-sort="price">均价</button>
+          </div>
+        </div>
+
+        <ul class="entries" id="entryList"></ul>
+
+        <div class="side__foot">
+          <label class="check"><input type="checkbox" id="toggleOut" checked /> 显示不符合过滤的小区（灰点）</label>
+          <span class="side__note" id="estNote">通勤：直线最近的 8 个精确计算，其余为估算</span>
+        </div>
+      </div>
+
+      <!-- 发现 -->
+      <div class="tabpane" data-tabpane="discover" hidden>
+        <div class="note">
+          在搜索范围内检索住宅类 POI，得到 <span class="num">6</span> 个本地库里没有的小区。勾选后批量入库，来源标「POI 发现」。
+          <div class="note__cost">本次检索消耗 <span class="num">3</span> 次调用 · 今日余 <span class="num">88</span> 次</div>
+        </div>
+        <ul class="cands" id="candList"></ul>
+        <div class="pane__actions">
+          <button class="btn btn--ghost" id="btnDiscover">重新检索</button>
+          <button class="btn btn--primary" id="btnAdopt" disabled>入库 0 个</button>
+        </div>
+      </div>
+
+      <!-- 待补 -->
+      <div class="tabpane" data-tabpane="gap" hidden>
+        <div class="note">
+          影像规则扫描发现 <span class="num">3</span> 处「有建筑群、但系统里没有」的区块。只是线索，不会自动入库。
+        </div>
+        <ul class="gaps" id="gapList"></ul>
+      </div>
+    </section>
+
+    <!-- 条件编辑（宽态） -->
+    <section class="pane pane--edit" data-pane="edit" hidden>
+      <div class="pane__head">
+        <h2>筛选条件</h2>
+        <button class="iconbtn" id="cancelEdit" aria-label="取消">×</button>
+      </div>
+
+      <div class="pane__body">
+        <fieldset class="field">
+          <legend>目的地</legend>
+          <ul class="dests" id="destList"></ul>
+          <button class="btn btn--ghost btn--xs" id="btnAddDest">＋ 添加目的地</button>
+          <p class="hint">每个目的地单独设通勤方式。所有点都只是「你要去的地方」，不分主次。</p>
+        </fieldset>
+
+        <fieldset class="field">
+          <legend>扩展半径</legend>
+          <label class="slider">
+            <span>半径 <em class="num" id="radOut">3.0</em> km</span>
+            <input type="range" id="radRange" min="0" max="150" value="30" />
+          </label>
+          <p class="hint" id="radHint">3 个目的地 → 取它们的外接圆，再向外扩 3 km。只剩 1 个目的地时，就是该点方圆 3 km。</p>
+        </fieldset>
+
+        <fieldset class="field">
+          <legend>预算与面积</legend>
+          <label class="slider">
+            <span>总价区间 <em class="num">150 – 320</em> 万</span>
+            <input type="range" min="80" max="600" value="150" />
+          </label>
+          <label class="slider">
+            <span>面积区间 <em class="num">80 – 140</em> ㎡</span>
+            <input type="range" min="40" max="300" value="80" />
+          </label>
+          <label class="slider">
+            <span>均价上限 <em class="num">24000</em> 元/㎡</span>
+            <input type="range" min="8000" max="40000" value="24000" />
+          </label>
+        </fieldset>
+
+        <fieldset class="field">
+          <legend>产权性质</legend>
+          <div class="chips">
+            <button class="chip is-on">商品房</button>
+            <button class="chip">经济适用房</button>
+            <button class="chip">安置房</button>
+            <button class="chip is-off">公寓（40年）</button>
+            <button class="chip is-off">小产权</button>
+          </div>
+          <p class="hint">点亮=只看，划掉=排除，不亮=不参与过滤。</p>
+        </fieldset>
+
+        <fieldset class="field">
+          <legend>数据来源</legend>
+          <div class="chips">
+            <button class="chip is-on">官方数据</button>
+            <button class="chip is-on">人工录入</button>
+            <button class="chip is-on">POI 发现</button>
+            <button class="chip is-off">仅样例数据</button>
+          </div>
+        </fieldset>
+
+        <fieldset class="field field--demo">
+          <legend>原型演示</legend>
+          <div class="inline">
+            <button class="btn btn--ghost btn--xs" id="demo1">切成 1 个目的地</button>
+            <button class="btn btn--ghost btn--xs" id="demo3">切成 3 个目的地</button>
+            <span class="muted">只为看两种形态的差异</span>
+          </div>
+        </fieldset>
+      </div>
+
+      <div class="pane__foot">
+        <button class="btn btn--ghost btn--xs" id="btnSettings2">接口与数据设置</button>
+        <button class="btn btn--ghost" id="cancelEdit2">取消</button>
+        <button class="btn btn--primary" id="btnSaveCond">保存</button>
+      </div>
+    </section>
+
+    <!-- 详情（两列：压缩列表 + 详情，Finder 列视图） -->
+    <section class="pane pane--detail" data-pane="detail" hidden>
+      <div class="split">
+
+        <!-- 左列：压缩后的列表 -->
+        <div class="col-list">
+          <div class="col-list__head">
+            结果 · <span class="num" id="miniCount">12</span>
+            <span class="col-list__hint">↑↓ 切换</span>
+          </div>
+          <ul class="mini" id="entryListMini"></ul>
+        </div>
+
+        <!-- 右列：详情 -->
+        <div class="col-detail">
+          <div class="pane__head">
+            <div class="pane__headmain">
+              <h2 id="dName">天瑞瑞璟小区</h2>
+              <div class="pane__headmeta" id="dMeta"></div>
+            </div>
+            <button class="iconbtn" id="closeDetail" title="收起详情（Esc）" aria-label="收起详情">×</button>
+          </div>
+          <div class="pane__body" id="dBody"></div>
+          <div class="pane__foot">
+            <button class="btn btn--ghost btn--xs">删除</button>
+            <button class="btn btn--ghost btn--xs" disabled title="阶段 4 上线">在影像上画边界</button>
+            <button class="btn btn--primary btn--xs">编辑</button>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+  </aside>
+</div>
+
+<!-- ================= 设置 ================= -->
+<div class="sheet" id="settingsSheet" hidden>
+  <div class="sheet__card">
+    <div class="sheet__head">
+      <h2>设置</h2>
+      <button class="iconbtn" data-close>×</button>
+    </div>
+    <div class="sheet__body">
+      <section class="setsec">
+        <h3>接口密钥</h3>
+        <p class="hint">只存本机，不上传。若 key 开了 IP 白名单或数字签名，必须关掉，否则报 10005 / 10007。</p>
+        <label class="f"><span>高德 Web 服务 key</span><input class="input" value="••••••••••••••••" /></label>
+        <label class="f"><span>天地图 tk（底图与影像）</span><input class="input" placeholder="未填写 · 当前用 OSM 底图" /></label>
+        <div class="quota">
+          <div class="quota__label">今日调用 <span class="num">12</span> / <span class="num">100</span>（按控制台额度自填）</div>
+          <div class="quota__bar"><i style="width:12%"></i></div>
+        </div>
+      </section>
+
+      <section class="setsec">
+        <h3>影像补漏阈值</h3>
+        <p class="hint">决定「待补清单」有多少条。调完点预览看前 20 个区块，别一次调太多。</p>
+        <label class="slider">
+          <span>建筑与绿化的交错度下限 <em class="num">0.58</em></span>
+          <input type="range" min="30" max="90" value="58" />
+        </label>
+        <label class="slider">
+          <span>建筑像素占比下限 <em class="num">0.28</em></span>
+          <input type="range" min="5" max="70" value="28" />
+        </label>
+        <label class="slider">
+          <span>离最近 POI 的最小距离 <em class="num">200</em> m</span>
+          <input type="range" min="0" max="800" value="200" />
+        </label>
+        <div class="inline">
+          <button class="btn btn--ghost btn--xs">预览前 20 个区块</button>
+          <span class="muted">上次扫描 <span class="num">2026-03-02 21:14</span> · <span class="num">286</span> 张瓦片</span>
+        </div>
+      </section>
+
+      <section class="setsec">
+        <h3>数据</h3>
+        <div class="inline">
+          <button class="btn btn--ghost btn--xs">导出 JSON 备份</button>
+          <button class="btn btn--ghost btn--xs">导入备份</button>
+          <button class="btn btn--ghost btn--xs">导入官方数据（GeoJSON）</button>
+        </div>
+        <p class="hint">官方数据不在插件里爬，由本地后端离线导出再导入。</p>
+      </section>
+    </div>
+  </div>
+</div>
+
+<script src="prototype.js"></script>
+</body>
+</html>
