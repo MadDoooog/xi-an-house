@@ -184,3 +184,15 @@ This project has a web UI. After observable changes, verify once via **Browser D
 ## Versioning
 
 Tag releases as `v0.0.x` for early milestones. `v0.0.1` — initial OSM-boundary GIS scaffold with crawl, map UI, and Docker Compose.
+
+## Where to pick up (extension work)
+
+`docs/extension/04-devlog.md` is the hand-off document: current capabilities, the design decisions that
+must not be re-litigated (coordinate systems, empty-by-default storage, the shadow-detection pipeline and
+its deliberate "no water handling" choice), the ordered TODO backlog (P0: candidate list from shadow
+scanning, P0: commute read-back), verification recipes and environment pitfalls.
+
+Tests live in `extension/tests/` (run from that directory; they load `../app` directly):
+
+- `node unit-background.mjs` — real `background.js` in a `vm` sandbox with fake-indexeddb (migration, import, CRUD)
+- `node e2e-amap.mjs` — Playwright + `--load-extension`, drives the real amap.com page (`XAT_CHROME` to point at a Chrome for Testing binary)

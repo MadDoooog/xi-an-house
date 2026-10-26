@@ -1,0 +1,14 @@
+{
+  "name": "xian-commute-ext-tests",
+  "private": true,
+  "type": "module",
+  "description": "Tests for the Xi'an commute extension (extension/app). Not part of the shipped extension.",
+  "scripts": {
+    "test:unit": "node unit-background.mjs",
+    "test:e2e": "node e2e-amap.mjs"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "^6.0.0",
+    "playwright": "^1.47.0"
+  }
+}
