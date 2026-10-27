@@ -1,15 +1,19 @@
 {
   "manifest_version": 3,
   "name": "西接通勤 · 通勤找房",
-  "version": "0.3.0",
-  "description": "在高德地图上叠加你收录的小区；卫星影像粗判 + 通勤交给高德自己算。数据只存本机，不上传。",
+  "version": "0.14.0",
+  "description": "自主卫星地图：阴影聚类 + 高德小区边界(polygon)覆盖 + POI 命名。",
   "minimum_chrome_version": "111",
   "permissions": [
+    "scripting",
     "storage"
   ],
   "host_permissions": [
     "https://*.amap.com/*",
-    "https://*.autonavi.com/*"
+    "https://*.autonavi.com/*",
+    "https://overpass-api.de/*",
+    "https://overpass.osm.ch/*",
+    "https://restapi.amap.com/*"
   ],
   "background": {
     "service_worker": "background.js"

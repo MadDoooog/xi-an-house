@@ -621,6 +621,30 @@
       return;
     }
 
+    if (data.type === "freeze") {
+      // Scanning a circle makes Chrome busy; lock the map so the user cannot
+      // pan/zoom out from under the tile stream (and so no view-change storms fire).
+      const on = !!data.on;
+      try {
+        if (state.map && state.map.setStatus) {
+          state.map.setStatus({
+            dragEnable: !on,
+            zoomEnable: !on,
+            doubleClickZoom: !on,
+            scrollWheel: !on,
+            keyboardEnable: !on,
+            jogEnable: !on,
+            animateEnable: !on,
+          });
+        }
+        state.frozen = on;
+        post("frozen", { on });
+      } catch (e) {
+        log("warn", "冻结地图失败", { error: String(e) });
+      }
+      return;
+    }
+
     if (data.type === "ping") {
       post("pong", { ready: state.ready, patched: state.patched, instances: state.instances });
       return;

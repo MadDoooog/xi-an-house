@@ -116,6 +116,33 @@
     </p>
   </div>
 
+  <h2>高德 Web 服务 key <small>阴影聚类后用 POI 反查小区名</small></h2>
+  <div class="card">
+    <div class="row">
+      <input type="text" id="amap-key" placeholder="粘贴高德「Web 服务」key" style="flex:1" />
+      <button class="btn btn--xs" id="btn-amap-key">保存</button>
+    </div>
+    <p class="hint" id="amap-key-state">未配置。没有 key 时阴影仍会扫描，但不会反查小区名。</p>
+    <p class="hint">
+      高德控制台 → 应用管理 → 新建应用 → 添加 Key → 服务平台选「Web服务」。这个 key 只存本机 IndexedDB。
+    </p>
+  </div>
+
+  <h2>卫星 / 阴影缓存 <small>清掉后下次扫描会重算</small></h2>
+  <div class="card">
+    <div class="row">
+      <button class="btn btn--xs" id="btn-cache-refresh">刷新统计</button>
+      <button class="btn btn--xs" id="btn-cache-shadow">只清阴影（保留瓦片）</button>
+      <button class="btn btn--xs" id="btn-cache-all">清空瓦片+阴影</button>
+    </div>
+    <p class="hint" id="cache-stat">—</p>
+    <p class="hint">
+      阴影结果有算法版本号（<code>SHADOW_CACHE_V</code>），换了阈值或绘制方式后旧结果会自动失效并重算，
+      一般不用手动清。这里手动清是给「图上还残留旧版本形状」时用的：
+      <b>只清阴影</b> 不会删瓦片图，重扫不用重新下载；<b>清空瓦片+阴影</b> 连图一起删。
+    </p>
+  </div>
+
   <h2>当前版本做了什么、没做什么</h2>
   <div class="card">
     <ul class="todo">

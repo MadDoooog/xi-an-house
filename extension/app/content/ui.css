@@ -677,3 +677,18 @@ h3 { font-size: 13.5px; }
 .scan-tile__s { font: 600 15px/1 ui-monospace, Menlo, Consolas, monospace; color: #9c2a22; }
 .scan-tile__h .num { font-size: 10.5px; color: #5b544a; }
 .scan-tile__acts { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+
+/* 阴影扫描进度条 */
+.scan-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(26, 24, 21, .12);
+  overflow: hidden;
+  margin: 6px 0 8px;
+}
+.scan-bar > i {
+  display: block;
+  height: 100%;
+  background: #d94a3a;
+  transition: width .18s linear;
+}

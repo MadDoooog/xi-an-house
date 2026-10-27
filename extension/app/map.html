@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>西接通勤 · 阴影地图</title>
+    <style>
+      html, body { height: 100%; margin: 0; background: #efebe3; overflow: hidden; }
+      #map { position: fixed; inset: 0; }
+    </style>
+  </head>
+  <body>
+    <!-- 底图 + 阴影多边形由 lib/slippymap.js 自绘 -->
+    <div id="map"></div>
+
+    <!--
+      侧栏、详情、录入、设置等全部复用注入版 UI：
+        content/ui.js 只通过 window.postMessage 跟地图钩子对话，
+        lib/hook-shim.js 用自绘地图把这套消息实现掉。
+      样式由 ui.js 自己把 content/ui.css 注入 Shadow DOM。
+    -->
+    <script src="lib/geo.js"></script>
+    <script src="lib/logger.js"></script>
+    <script src="lib/imagery.js"></script>
+    <script src="lib/slippymap.js"></script>
+    <script src="lib/shadow-clusters.js"></script>
+    <script src="lib/hook-shim.js"></script>
+    <script src="content/ui.js"></script>
+  </body>
+</html>

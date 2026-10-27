@@ -48,3 +48,11 @@ document.getElementById("diag").addEventListener("click", () => {
 });
 
 refresh();
+
+// 阴影地图：扩展自己的整页界面（不再往高德页面里注图层）
+const openMap = document.getElementById("open-map");
+if (openMap) {
+  openMap.addEventListener("click", () => {
+    chrome.tabs.create({ url: chrome.runtime.getURL("map.html") });
+  });
+}

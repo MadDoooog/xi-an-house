@@ -66,7 +66,11 @@
     formIsNew: false,
     geoSeq: 0,
     sat: {},             // 小区影像缓存：id -> imagery.community 结果
-    scan: null,          // 大圆影像扫描结果
+    scan: null,          // 阴影扫描结果（逐瓦片累加）
+    scanScreen: null,    // 投影后的屏幕多边形
+    scanReqId: 0,
+    scanSnapshot: null,
+    scanRunning: false,
   };
 
   /* ---------------- 工具 ---------------- */
@@ -163,7 +167,10 @@
       lat = t;
     }
     if (!okLng(lng) || !okLat(lat)) return null;
-    return { lng, lat };
+    // 粘贴来的坐标按 GCJ-02 理解（高德/腾讯的复制地址都是这个系），
+    // 统一转成 WGS84 再存——库内、接口、导出全是 WGS84。
+    const [wlng, wlat] = geo.gcj02ToWgs84(lng, lat);
+    return { lng: wlng, lat: wlat };
   }
 
   function stripCoords(text) {
@@ -218,6 +225,22 @@
   }
 
   /** 右键菜单「复制地址」被点时，MAIN world 把坐标发过来；这里转 WGS84 后写剪贴板 */
+  /** 外部（阴影聚类）写入小区后，重新拉一遍数据并重绘 */
+  async function reloadData() {
+    try {
+      const data = await rpc("boot");
+      state.settings = data.settings;
+      state.communities = data.communities || [];
+      state.dests = (data.settings && data.settings.destinations) || [];
+      compute();
+      render();
+      requestProjection();
+      log.info("数据已刷新", { communities: state.communities.length });
+    } catch (e) {
+      log.warn("刷新数据失败", { error: String(e) });
+    }
+  }
+
   function onCtxCopy(payload) {
     const p = payload || {};
     const g = p.gcj;
@@ -225,17 +248,18 @@
       toast("右键没取到坐标");
       return;
     }
-    const [lng, lat] = geo.gcj02ToWgs84(g[0], g[1]);
-    const coordText = `${lng.toFixed(6)},${lat.toFixed(6)}`;
+    // 复制 GCJ-02：粘回高德（或任何国内地图）才落在同一个点位。
+    // 存库仍是 WGS84，由 parseCoords 在粘回来时换算。
+    const coordText = `${g[0].toFixed(6)},${g[1].toFixed(6)}`;
     const where = p.address || p.poi || "";
     const text = where ? `${where} (${coordText})` : coordText;
     copyText(text).then((ok) => {
       if (!ok) {
         toast("复制失败，请手动选中后 Ctrl+C");
       } else if (where) {
-        toast("已复制地址，粘贴到「目的地」或「小区」输入框");
+        toast("已复制地址（GCJ-02），可直接粘到高德或本面板");
       } else {
-        toast("已复制坐标（高德没返回地址文字，可用「解析」补地址）");
+        toast("已复制坐标（GCJ-02，高德可直接定位）");
       }
       log.info("右键复制结果", { ok, text });
     });
@@ -771,31 +795,201 @@
     }
   }
 
+  /* ---------------- 阴影扫描：保存时触发，逐瓦片算、逐瓦片画 ---------------- */
+
+  const SCAN_MAX_TILES = 36;
+  const SCAN_RADIUS_M = 600;
+
+  function freezeMap(on) {
+    window.postMessage({ __xat: "ui", type: "freeze", on: !!on }, "*");
+  }
+
   async function startScan() {
+    // 自绘地图页：扫描统一交给适配层（整圆覆盖 + 掩膜 + 聚类 + POI 反查）
+    if (window.__xatShim && typeof window.__xatShim.scan === "function") {
+      await window.__xatShim.scan();
+      return;
+    }
     const roi = state.roi;
     if (!roi) {
       toast("先设目的地，才有搜索范围");
       return;
     }
-    state.scan = { loading: true };
+    if (state.scanRunning) {
+      toast("正在扫描中…");
+      return;
+    }
+    state.scanRunning = true;
+    state.scan = {
+      incremental: true,
+      loading: true,
+      polys: [],
+      lens: [],
+      roads: [],
+      done: 0,
+      total: 0,
+      cached: 0,
+      failed: 0,
+      at: Date.now(),
+    };
+    state.scanScreen = null;
     state.tab = "discover";
     renderDiscover();
+    freezeMap(true);
+    draw();
     try {
-      const res = await rpc("imagery.area", {
+      const plan = await rpc("scan.plan", {
         lng: roi.center[0],
         lat: roi.center[1],
-        radiusM: Math.min(3000, Math.max(150, roi.radius)),
-        maxTiles: 25,
+        radiusM: Math.min(SCAN_RADIUS_M, Math.max(200, roi.radius)),
+        maxTiles: SCAN_MAX_TILES,
       });
-      state.scan = Object.assign({}, res, { loading: false, at: Date.now() });
+      state.scan.zoom = plan.zoom;
+      state.scan.total = plan.tiles.length;
+      state.scan.radiusM = plan.radiusM;
+      // 缩放到扫描范围，否则瓦片多边形在地图上看不清
+      const gcjCenter = geo.wgs84ToGcj02(roi.center[0], roi.center[1]);
+      window.postMessage(
+        { __xat: "ui", type: "fit", center: gcjCenter, zoom: Math.max(14, plan.zoom - 1) },
+        "*",
+      );
       renderDiscover();
-      toast(`扫描完成：${res.tiles.length} 张瓦片`);
-      log.info("大圆影像扫描完成", { zoom: res.zoom, tiles: res.tiles.length, failures: res.failures });
+      fetchRoads(plan.tiles);
+
+      for (const t of plan.tiles) {
+        if (!state.scanRunning) break;
+        try {
+          const res = await rpc("scan.tile", { z: t.z, x: t.x, y: t.y });
+          for (const b of res.blobs || []) {
+            if (b.areaM2 < 3000) continue;   // 太碎的块不画，避免糊成一片
+            state.scan.polys.push(b.hull);
+            state.scan.lens.push(b.hull.length);
+          }
+          if (res.cached) state.scan.cached += 1;
+        } catch (e) {
+          state.scan.failed += 1;
+          log.warn("瓦片阴影失败", { key: t.key, error: String(e) });
+        }
+        state.scan.done += 1;
+        requestShadowProjection();
+        renderDiscover();
+        // yield so the map can paint and the tab stays responsive
+        await new Promise((res) => setTimeout(res, 0));
+      }
+      state.scan.loading = false;
+      toast(
+        `阴影完成：${state.scan.polys.length} 块 · 缓存命中 ${state.scan.cached}/${state.scan.total}`,
+      );
+      log.info("阴影扫描完成", {
+        tiles: state.scan.total,
+        cached: state.scan.cached,
+        failed: state.scan.failed,
+        blobs: state.scan.polys.length,
+      });
     } catch (e) {
-      state.scan = { error: String(e.message || e) };
+      state.scan = { incremental: true, error: String(e.message || e) };
+      log.error("阴影扫描失败", { error: String(e) });
+      toast("阴影扫描失败：" + (e.message || e));
+    } finally {
+      state.scanRunning = false;
+      freezeMap(false);
       renderDiscover();
-      log.error("大圆影像扫描失败", { error: String(e) });
+      draw();
     }
+  }
+
+  /** 路网：拿 tiles 的外接 bbox（WGS84），失败不影响阴影 */
+  async function fetchRoads(tiles) {
+    try {
+      let s = 90;
+      let w = 180;
+      let n = -90;
+      let e = -180;
+      for (const t of tiles) {
+        for (const [dx, dy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+          const ll = tileToWgs84(t.z, t.x + dx, t.y + dy);
+          if (ll[1] < s) s = ll[1];
+          if (ll[1] > n) n = ll[1];
+          if (ll[0] < w) w = ll[0];
+          if (ll[0] > e) e = ll[0];
+        }
+      }
+      const res = await rpc("scan.roads", { bbox: [s, w, n, e] });
+      if (!state.scan || !state.scan.incremental) return;
+      state.scan.roads = res.roads || [];
+      requestShadowProjection();
+      log.info("路网已绘制", { ways: res.count });
+    } catch (e) {
+      log.warn("路网获取失败（不影响阴影）", { error: String(e) });
+    }
+  }
+
+  function tileToWgs84(z, x, y) {
+    const n2 = 2 ** z;
+    const gLng = (x / n2) * 360 - 180;
+    const gLat = (Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / n2))) * 180) / Math.PI;
+    return geo.gcj02ToWgs84(gLng, gLat);
+  }
+
+  let shadowProjPending = null;
+  function requestShadowProjection() {
+    if (shadowProjPending) return;
+    shadowProjPending = requestAnimationFrame(() => {
+      shadowProjPending = null;
+      const sc = state.scan;
+      const polys = (sc && sc.polys) || [];
+      const roads = (sc && sc.roads) || [];
+      if (!polys.length && !roads.length) {
+        state.scanScreen = null;
+        draw();
+        return;
+      }
+      const pts = [];
+      for (const p of polys) for (const q of p) pts.push(q);
+      for (const r of roads) for (const q of r.line) pts.push(q);
+      state.scanSnapshot = { lens: (sc && sc.lens ? sc.lens.slice() : []), roadLens: roads.map((r) => r.line.length) };
+      state.scanReqId = ++projSeq;
+      window.postMessage({ __xat: "ui", type: "project", reqId: state.scanReqId, points: pts }, "*");
+    });
+  }
+
+  /** 把投影回来的屏幕坐标画上去：先路网、再阴影 */
+  function drawScanLayer() {
+    const sp = state.scanScreen;
+    if (!sp) return;
+    ctx.save();
+    for (const r of sp.roads) {
+      const major = r.class === "trunk" || r.class === "primary" || r.class === "secondary";
+      ctx.beginPath();
+      let started = false;
+      for (const p of r.line) {
+        if (!p) { started = false; continue; }
+        if (!started) { ctx.moveTo(p[0], p[1]); started = true; } else ctx.lineTo(p[0], p[1]);
+      }
+      // 浅底图上白线看不见：先描白边再压深色
+      ctx.lineWidth = (major ? 3.4 : 2.2) + 2;
+      ctx.strokeStyle = "rgba(255,255,255,.75)";
+      ctx.stroke();
+      ctx.lineWidth = major ? 3.4 : 2.2;
+      ctx.strokeStyle = major ? "rgba(24,52,96,.85)" : "rgba(24,52,96,.55)";
+      ctx.stroke();
+    }
+    ctx.fillStyle = "rgba(217,74,58,.16)";
+    ctx.strokeStyle = "rgba(217,74,58,.9)";
+    ctx.lineWidth = 1.2;
+    for (const ring of sp.polys) {
+      if (!ring.length) continue;
+      ctx.beginPath();
+      let started = false;
+      for (const p of ring) {
+        if (!p) continue;
+        if (!started) { ctx.moveTo(p[0], p[1]); started = true; } else ctx.lineTo(p[0], p[1]);
+      }
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+    ctx.restore();
   }
 
   function renderDiscover() {
@@ -804,6 +998,18 @@
     const s = state.scan;
     if (!s) {
       out.innerHTML = `<p class="hint">还没扫描。点上面的按钮会抓 20–25 张瓦片并分析；首次约 10–20 秒，之后走本机缓存。</p>`;
+      return;
+    }
+    if (s.incremental) {
+      if (s.error) {
+        out.innerHTML = `<div class="sat__ph sat__ph--bad">扫描失败：${esc(s.error)}</div>`;
+        return;
+      }
+      const pct = s.total ? Math.round((s.done / s.total) * 100) : 0;
+      out.innerHTML = `
+        <div class="sat__ph">${s.loading ? "扫描中" : "扫描完成"} ${s.done}/${s.total}（${pct}%）· 阴影 ${s.polys.length} 块</div>
+        <div class="scan-bar"><i style="width:${pct}%"></i></div>
+        <p class="hint">z${s.zoom || "-"} · 缓存命中 ${s.cached}${s.failed ? ` · 失败 ${s.failed}` : ""} · 阴影实时叠加在地图上（红色），白色为路网</p>`;
       return;
     }
     if (s.loading) {
@@ -1461,6 +1667,36 @@
     });
   }
 
+  function onScanProjected(payload) {
+    const { points, info, ready } = payload || {};
+    if (!ready || !points || !info || !info.rect) return;
+    const ox = info.rect.left || 0;
+    const oy = info.rect.top || 0;
+    const snap = state.scanSnapshot || { lens: [], roadLens: [] };
+    let i = 0;
+    const polys = [];
+    for (const len of snap.lens) {
+      const ring = [];
+      for (let k = 0; k < len; k += 1) {
+        const p = points[i++];
+        ring.push(p ? [ox + p[0], oy + p[1]] : null);
+      }
+      polys.push(ring);
+    }
+    const roads = [];
+    const src = (state.scan && state.scan.roads) || [];
+    for (let ri = 0; ri < snap.roadLens.length; ri += 1) {
+      const line = [];
+      for (let k = 0; k < snap.roadLens[ri]; k += 1) {
+        const p = points[i++];
+        line.push(p ? [ox + p[0], oy + p[1]] : null);
+      }
+      roads.push({ class: (src[ri] && src[ri].class) || "road", line });
+    }
+    state.scanScreen = { polys, roads };
+    draw();
+  }
+
   function onProjectResult(payload) {
     const { reqId, points, info, ready } = payload || {};
     if (!reqId) return;
@@ -1476,6 +1712,8 @@
     const toScreen = (p) => (p ? [ox + p[0], oy + p[1]] : null);
 
     state.proj = { points, info, toScreen };
+    // 视野变了：阴影/路网也要重新投影，否则会停留在旧的屏幕坐标上
+    if (state.scan && (state.scan.polys.length || state.scan.roads.length)) requestShadowProjection();
     draw();
   }
 
@@ -1591,6 +1829,9 @@
       if (!p) return;
       drawPin(p, DIGITS[di], DEST_COLORS[di], state.dests[di].name);
     });
+
+    // 阴影 + 路网
+    drawScanLayer();
   }
 
   function drawPin(p, letter, color, label) {
@@ -1633,6 +1874,37 @@
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
     const data = event.data;
+    if (data && data.__xat === "ui" && data.type === "debug-state") {
+      window.postMessage(
+        {
+          __xat: "main",
+          type: "debug-state",
+          payload: {
+            roi: state.roi ? { radius: Math.round(state.roi.radius), center: state.roi.center } : null,
+            scan: state.scan
+              ? { zoom: state.scan.zoom, done: state.scan.done, total: state.scan.total, polys: state.scan.polys.length, lens: state.scan.lens.length, roads: state.scan.roads.length, loading: state.scan.loading }
+              : null,
+            screen: state.scanScreen ? { polys: state.scanScreen.polys.length, roads: state.scanScreen.roads.length, first: state.scanScreen.polys[0] ? state.scanScreen.polys[0].slice(0, 2) : null } : null,
+            proj: !!state.proj,
+            scanReqId: state.scanReqId,
+            hookReady: state.hookReady,
+          },
+        },
+        "*",
+      );
+      return;
+    }
+
+    // 调试/自动化入口：在页面控制台里 post 一条消息即可触发一次扫描
+    if (data && data.__xat === "ui" && data.type === "debug-scan" && data.dest) {
+      const d = data.dest;
+      state.settings.destinations = [{ name: d.name || "测试目的地", lng: d.lng, lat: d.lat, mode: d.mode || "walk" }];
+      rpc("settings.set", { patch: { destinations: state.settings.destinations } }).catch(() => {});
+      recomputeAndRender();
+      setTimeout(() => startScan(), 150);
+      return;
+    }
+
     if (!data || data.__xat !== "main") return;
 
     if (data.type === "hook-log") {
@@ -1654,7 +1926,12 @@
     }
 
     if (data.type === "project-result") {
-      onProjectResult(data.payload);
+      const payload = data.payload || {};
+      if (payload.reqId && payload.reqId === state.scanReqId) {
+        onScanProjected(payload);
+        return;
+      }
+      onProjectResult(payload);
       return;
     }
 
@@ -1662,6 +1939,11 @@
       const info = data.payload || {};
       log.info("地图信息", info);
       if (info.ready) markHookReady(info, "get-info");
+      return;
+    }
+
+    if (data.type === "data-changed") {
+      reloadData();
       return;
     }
 
@@ -1780,6 +2062,7 @@
           setPanel("list");
           recomputeAndRender();
           toast("已保存");
+          // 阴影扫描由地图适配层负责（整圆 + 掩膜 + 聚类），这里不再触发
         })
         .catch((err) => log.error("保存设置失败", { error: String(err) }));
     }

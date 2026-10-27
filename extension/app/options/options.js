@@ -217,3 +217,65 @@ refreshStatus().then(loadLogs);
 setInterval(() => {
   refreshStatus();
 }, 5000);
+
+/* ---- 缓存面板 ---- */
+  /* ---- 缓存 ---- */
+  async function refreshCache() {
+    const el = document.getElementById("cache-stat");
+    el.textContent = "读取中…";
+    try {
+      const c = await rpc("imagery.cache");
+      const mb = (n) => (n / 1048576).toFixed(1);
+      el.textContent =
+        `瓦片 ${c.count} 张（${mb(c.bytes)} MB）· 含阴影 ${c.shadowCount} 张` +
+        `（${mb(c.shadowBytes || 0)} MB）· 过期阴影 ${c.staleShadow} 张`;
+    } catch (e) {
+      el.textContent = "读取失败：" + e.message;
+    }
+  }
+  document.getElementById("btn-cache-refresh")?.addEventListener("click", refreshCache);
+  document.getElementById("btn-cache-shadow")?.addEventListener("click", async () => {
+    if (!confirm("只清阴影分析结果（瓦片保留，重扫不用重新下载）？")) return;
+    const r = await rpc("imagery.clearShadow");
+    await refreshCache();
+    alert(`已清 ${r.cleared} 张瓦片的阴影结果，保留 ${r.kept} 张瓦片。回地图页重新扫描即可。`);
+  });
+  document.getElementById("btn-cache-all")?.addEventListener("click", async () => {
+    if (!confirm("清空所有瓦片和阴影？下次扫描需要重新下载全部瓦片。")) return;
+    await rpc("imagery.clear");
+    await refreshCache();
+    alert("已清空瓦片与阴影缓存。");
+  });
+  refreshCache();
+  setInterval(refreshCache, 5000);
+
+/* ---- 高德 key ---- */
+(async () => {
+  const input = document.getElementById("amap-key");
+  const stateEl = document.getElementById("amap-key-state");
+  const btn = document.getElementById("btn-amap-key");
+  if (!input || !btn) return;
+  const show = async () => {
+    try {
+      const d = await rpc("boot");
+      const key = (d.settings && d.settings.amapKey) || "";
+      input.value = key;
+      stateEl.textContent = key
+        ? `已配置（${key.slice(0, 6)}…${key.slice(-4)}）`
+        : "未配置。没有 key 时阴影仍会扫描，但不会反查小区名。";
+    } catch (e) {
+      stateEl.textContent = "读取失败：" + e.message;
+    }
+  };
+  btn.addEventListener("click", async () => {
+    const key = input.value.trim();
+    try {
+      await rpc("settings.set", { patch: { amapKey: key } });
+      await show();
+      toast("高德 key 已保存");
+    } catch (e) {
+      stateEl.textContent = "保存失败：" + e.message;
+    }
+  });
+  show();
+})();

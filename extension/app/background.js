@@ -11,6 +11,7 @@
 
 // 纯函数影像分析（瓦片对齐、阈值、长暗带 PCA）
 importScripts("lib/imagery.js");
+importScripts("lib/shadow.js");
 
 const DB_NAME = "xat";
 const DB_VERSION = 3;
@@ -109,8 +110,12 @@ const idb = {
 
 /* ---------------- 默认设置 ---------------- */
 
+// 高德「Web 服务」key（POI 反查小区用）。可在设置页覆盖；留空则用这个内置值。
+const DEFAULT_AMAP_KEY = "b58587dccf8efd1021dee8dcdbc43845";
+
 const DEFAULT_SETTINGS = {
   key: "main",
+  amapKey: DEFAULT_AMAP_KEY,
   // 默认空：目的地由你右键复制地址后粘贴添加
   destinations: [],
   destinationCount: 0,
@@ -209,6 +214,18 @@ function centroidOfGeometry(geom) {
 }
 
 /** 把各种来源的记录统一成本插件的 community 结构 */
+/** 把 "lng,lat;lng,lat;…" 解析成 [[lng,lat],…]；不是坐标串就返回 null */
+function parsePolygonString(v) {
+  if (typeof v !== "string" || v.length < 20) return null;
+  if (!/^-?\d{2,3}\.\d{3,},\d{1,2}\.\d{3,}(;-?\d{2,3}\.\d{3,},\d{1,2}\.\d{3,})+/.test(v.trim())) return null;
+  const pts = v
+    .trim()
+    .split(";")
+    .map((seg) => seg.split(",").map(Number))
+    .filter((p) => p.length === 2 && Number.isFinite(p[0]) && Number.isFinite(p[1]));
+  return pts.length >= 3 ? pts : null;
+}
+
 function normalizeCommunity(raw, defaults) {
   if (!raw || typeof raw !== "object") return null;
   const d = defaults || {};
@@ -243,6 +260,14 @@ function normalizeCommunity(raw, defaults) {
     propertyType: raw.propertyType || "待确认",
     sources: Array.isArray(raw.sources) && raw.sources.length ? raw.sources.slice() : d.sources || ["manual"],
     tags: Array.isArray(raw.tags) ? raw.tags.slice() : [],
+    // 小区轮廓（GCJ-02 [[lng,lat],…]），来自阴影聚类，用来在地图上覆盖阴影
+    footprint: Array.isArray(raw.footprint)
+      ? raw.footprint
+          .slice(0, 300)
+          .map((q) => [num(q && q[0]), num(q && q[1])])
+          .filter((q) => q[0] != null && q[1] != null)
+      : null,
+    footprintSource: raw.footprintSource || null,
     official,
     createdAt: raw.createdAt || Date.now(),
     updatedAt: Date.now(),
@@ -326,6 +351,13 @@ const bgLog = (level, msg, data) => addLogs([{ level, source: "bg", msg, data }]
 
 const TILE_HOSTS = ["webst01", "webst02", "webst03", "webst04"];
 const TILE_PX = 256;
+// 阴影分析算法版本：改动 lib/shadow.js 的阈值/流程时递增，旧缓存自动失效
+const SHADOW_CACHE_V = 2;
+
+// 站内 poiInfo 的反爬状态：被拦两次就本次会话不再尝试，避免拖慢扫描
+let polyBlocked = 0;
+let polyTabId = null;
+let polyTabTimer = null;
 
 function blobToDataUrl(blob) {
   return blob.arrayBuffer().then((buf) => {
@@ -597,6 +629,258 @@ const handlers = {
     return handlers["imagery.area"]({ lng, lat, radiusM: 170, maxTiles: 9 });
   },
 
+  /* ---------------- 阴影扫描（保存时才触发，逐瓦片返回） ---------------- */
+
+  /**
+   * 规划一次扫描：只算瓦片清单，不取图、不计算。
+   * 已缓存过阴影结果的瓦片标记 cached，前端可以直接画、不用等。
+   */
+  async "scan.plan"({ lng, lat, radiusM = 600, maxTiles = 400, zoom: fixedZoom } = {}) {
+    if (!Number.isFinite(lng) || !Number.isFinite(lat)) throw new Error("缺少坐标");
+    const I = XAT_IMAGERY;
+    const requested = Math.max(150, Math.min(20000, Number(radiusM) || 600));
+    const cap = Math.max(1, Math.min(1200, Number(maxTiles) || 400));
+    // 不再裁剪半径：按圆算全部瓦片，瓦片太多时降低 zoom（而不是缩小范围）
+    const zoom = Number.isFinite(fixedZoom)
+      ? Math.max(12, Math.min(18, fixedZoom))
+      : I.pickZoom(requested, cap, 12);
+    const r = requested;
+    let list = I.tilesForCircle(lng, lat, r, zoom);
+    const truncated = list.length > cap;
+    if (truncated) list = list.slice(0, cap);
+    const rows = await idb.getAll("tiles").catch(() => []);
+    const done = new Set(rows.filter((t) => t && t.shadow).map((t) => t.key));
+    const tiles = list.map((t) => {
+      const key = `${t.z}/${t.x}/${t.y}`;
+      return { z: t.z, x: t.x, y: t.y, key, cached: done.has(key) };
+    });
+    return {
+      zoom,
+      radiusM: r,
+      requestedRadiusM: requested,
+      clipped: truncated,
+      truncated,
+      maxTiles: cap,
+      tiles,
+      cachedCount: tiles.filter((t) => t.cached).length,
+    };
+  },
+
+  /** 单瓦片：命中缓存直接返回；否则取图 → 阴影分析 → 落库 */
+  async "scan.tile"({ z, x, y, ratio } = {}) {
+    if (!Number.isFinite(z) || !Number.isFinite(x) || !Number.isFinite(y)) throw new Error("缺少瓦片坐标");
+    const key = `${z}/${x}/${y}`;
+    const row = await idb.get("tiles", key).catch(() => null);
+    const sameRatio = !Number.isFinite(ratio) || !row?.shadow?.ratio || row.shadow.ratio === ratio;
+    if (row && row.shadow && row.shadow.v === SHADOW_CACHE_V && sameRatio) {
+      return Object.assign({ key, cached: true }, row.shadow);
+    }
+
+    const centerLat = XAT_IMAGERY.tileToLonLatFloat(x + 0.5, y + 0.5, z)[1];
+    const mPerPx = metersPerPixel(z, centerLat);
+
+    let blob = row && row.blob;
+    if (!blob) {
+      const host = TILE_HOSTS[Math.abs(x + y) % TILE_HOSTS.length];
+      const url = `https://${host}.is.autonavi.com/appmaptile?style=6&x=${x}&y=${y}&z=${z}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`瓦片 ${key} HTTP ${res.status}`);
+      blob = await res.blob();
+    }
+
+    const bmp = await createImageBitmap(blob);
+    const cv = new OffscreenCanvas(TILE_PX, TILE_PX);
+    const ctx = cv.getContext("2d", { willReadFrequently: true });
+    ctx.drawImage(bmp, 0, 0, TILE_PX, TILE_PX);
+    if (typeof bmp.close === "function") bmp.close();
+    const img = ctx.getImageData(0, 0, TILE_PX, TILE_PX);
+    const opts = { mPerPx, z, tx: x, ty: y };
+    if (Number.isFinite(ratio)) opts.ratio = Math.max(0.1, Math.min(0.6, ratio));
+    const out = XAT_SHADOW.analyzeTile(img.data, TILE_PX, opts);
+
+    // 掩膜存成 PNG，前端按瓦片贴图直接画（凸包会拼出方格网，看着歪）
+    let maskPng = null;
+    if (out.maskRgba) {
+      try {
+        const cv = new OffscreenCanvas(TILE_PX, TILE_PX);
+        cv.getContext("2d").putImageData(new ImageData(out.maskRgba, TILE_PX, TILE_PX), 0, 0);
+        const blob = await cv.convertToBlob({ type: "image/png" });
+        maskPng = await blobToDataUrl(blob);
+      } catch (e) {
+        await bgLog("warn", "掩膜编码失败", { tile: key, error: String(e) });
+      }
+    }
+
+    const shadow = { v: SHADOW_CACHE_V, coverage: out.coverage, blobs: out.blobs, ref: out.ref, ms: out.ms, maskPng, ratio: Number.isFinite(ratio) ? ratio : null, at: Date.now() };
+    await idb.put("tiles", Object.assign({}, row || {}, { key, z, x, y, blob, shadow, at: Date.now() }));
+    return Object.assign({ key, cached: false }, shadow);
+  },
+
+  /** 路网：Overpass 取干道，转 GCJ 供地图绘制。失败不阻塞扫描。 */
+  async "scan.roads"({ bbox } = {}) {
+    if (!Array.isArray(bbox) || bbox.length !== 4) throw new Error("缺少 bbox");
+    const [s, w, n, e] = bbox; // WGS84: south, west, north, east
+    const q = `[out:json][timeout:25];way["highway"~"primary|secondary|tertiary|residential|trunk"](${s},${w},${n},${e});out geom;`;
+    // Overpass 经常 502（过载），换镜像 + 重试一次
+    const mirrors = [
+      "https://overpass-api.de/api/interpreter",
+      "https://overpass-api.de/api/interpreter",
+      "https://overpass.osm.ch/api/interpreter",
+    ];
+    let data = null;
+    let lastErr = "";
+    for (const url of mirrors) {
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: "data=" + encodeURIComponent(q),
+        });
+        if (!res.ok) { lastErr = `HTTP ${res.status}`; continue; }
+        const json = await res.json();
+        if (json && Array.isArray(json.elements) && json.elements.length) { data = json; break; }
+        data = json;
+      } catch (e) {
+        lastErr = String(e);
+      }
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    if (!data) throw new Error(`Overpass 失败：${lastErr}`);
+    const roads = [];
+    for (const el of data.elements || []) {
+      if (el.type !== "way" || !el.geometry) continue;
+      const line = el.geometry.map((p) => XAT_IMAGERY.wgs84ToGcj02(p.lon, p.lat));
+      if (line.length > 1) roads.push({ class: (el.tags && el.tags.highway) || "road", line });
+    }
+    return { count: roads.length, roads };
+  },
+
+  /**
+   * 高德 POI 周边搜索（小区）。入参经纬度是 GCJ-02。
+   * key 走设置页填的 amapKey（Web 服务 key），没配就报错让用户去填。
+   */
+  async "poi.nearby"({ lng, lat, radius = 250, limit = 6, types = "120302" } = {}) {
+    if (!Number.isFinite(lng) || !Number.isFinite(lat)) throw new Error("缺少坐标");
+    const s = normalizeSettings(await idb.get("settings", "main"));
+    const key = String(s.amapKey || "").trim() || DEFAULT_AMAP_KEY;
+    if (!key) throw new Error("还没配高德 key（设置与诊断 → 高德 Web 服务 key）");
+    const url =
+      "https://restapi.amap.com/v3/place/around?key=" + encodeURIComponent(key) +
+      "&location=" + lng.toFixed(6) + "," + lat.toFixed(6) +
+      "&radius=" + Math.max(50, Math.min(1000, Number(radius) || 250)) +
+      "&types=" + encodeURIComponent(types) +
+      "&offset=" + Math.max(1, Math.min(25, Number(limit) || 6)) +
+      "&page=1&extensions=base&sortrule=distance";
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`高德 POI HTTP ${res.status}`);
+    const json = await res.json();
+    if (json.status !== "1") throw new Error(`高德 POI 失败：${json.info || json.infocode}`);
+    const pois = (json.pois || []).map((p) => {
+      const [plng, plat] = String(p.location || "").split(",").map(Number);
+      return {
+        id: p.id,
+        name: p.name,
+        address: p.address,
+        district: p.adname,
+        type: p.type,
+        lng: plng,
+        lat: plat,
+        distance: Number(p.distance) || null,
+      };
+    }).filter((p) => Number.isFinite(p.lng) && Number.isFinite(p.lat));
+    return { count: pois.length, pois };
+  },
+
+  /**
+   * 小区边界：高德 PC 站内接口 /ssr/api/getPoiDetail?id=<poiId>
+   * 返回 data.spec.mining_shape.shape = "lng,lat;lng,lat;…"（GCJ-02）。
+   * 这个接口有反爬（bx-ua / x-dc 指纹头由站点 JS 生成），所以必须在**真实高德标签页**的
+   * MAIN world 里发 XHR。拿不到（验证码/超时）返回 ok:false，调用方回退到阴影轮廓。
+   */
+  async "poi.polygon"({ id, name, lng, lat, city = "610400" } = {}) {
+    if (!id) throw new Error("缺少 POI id");
+    if (polyBlocked >= 2) return { ok: false, reason: "blocked-session", id };
+    await new Promise((r) => setTimeout(r, 900)); // 别打太急，会触发验证码
+
+    const tabs = await chrome.tabs.query({ url: "https://www.amap.com/*" });
+    let tab = tabs.find((t) => t.id != null);
+    let created = false;
+    if (!tab) {
+      if (polyTabId != null) {
+        try {
+          tab = await chrome.tabs.get(polyTabId);
+        } catch {
+          tab = null;
+        }
+      }
+      if (!tab) {
+        tab = await chrome.tabs.create({ url: "https://www.amap.com/", active: false });
+        polyTabId = tab.id;
+        created = true;
+        await new Promise((r) => setTimeout(r, 3500));
+      }
+    }
+
+    try {
+      const url = "https://amap-pc-ssr.amap.com/ssr/api/getPoiDetail?id=" + encodeURIComponent(id);
+      const [out] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: "MAIN",
+        func: (u) =>
+          new Promise((resolve) => {
+            const x = new XMLHttpRequest();
+            x.open("GET", u, true);
+            x.timeout = 12000;
+            x.onload = () => resolve({ status: x.status, text: String(x.responseText || "") });
+            x.onerror = () => resolve({ status: 0, text: "xhr-error" });
+            x.ontimeout = () => resolve({ status: -1, text: "timeout" });
+            x.send();
+          }),
+        args: [url],
+      });
+      const r = (out && out.result) || {};
+      const text = String(r.text || "");
+      const blocked = !text || (text.indexOf("mining_shape") < 0 && /rgv587|punish|FAIL_SYS_USER_VALIDATE/i.test(text));
+      if (blocked) {
+        polyBlocked += 1;
+        await bgLog("warn", "小区边界被拦", { id, status: r.status, head: text.slice(0, 120) });
+        return { ok: false, reason: "blocked", id };
+      }
+      let json;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        polyBlocked += 1;
+        return { ok: false, reason: "not-json", id };
+      }
+      const spec = json && json.data && json.data.spec;
+      const shape = spec && spec.mining_shape && spec.mining_shape.shape;
+      const pts = parsePolygonString(shape);
+      if (!pts) return { ok: false, reason: "no-shape", id, name: (json.data && json.data.base && json.data.base.name) || name };
+      const base = (json.data && json.data.base) || {};
+      await bgLog("info", "拿到小区边界", { id, name: base.name, points: pts.length });
+      return {
+        ok: true,
+        id,
+        name: base.name || name || null,
+        address: base.address || null,
+        pts,
+        source: "amap-getPoiDetail",
+      };
+    } catch (e) {
+      await bgLog("warn", "小区边界请求失败", { id, error: String(e) });
+      return { ok: false, reason: "error", error: String(e) };
+    } finally {
+      if (polyTabId != null) {
+        clearTimeout(polyTabTimer);
+        polyTabTimer = setTimeout(() => {
+          if (polyTabId != null) chrome.tabs.remove(polyTabId).catch(() => {});
+          polyTabId = null;
+        }, 120000);
+      }
+    }
+  },
+
   /** 人工判定：like / dislike / ignore / none（清除） */
   async "imagery.verdict"({ key, verdict }) {
     if (!key) throw new Error("缺少瓦片 key");
@@ -609,7 +893,29 @@ const handlers = {
 
   async "imagery.cache"() {
     const all = await idb.getAll("tiles").catch(() => []);
-    return { count: all.length, bytes: all.reduce((s, t) => s + (t.blob ? t.blob.size : 0), 0) };
+    const withShadow = all.filter((t) => t && t.shadow);
+    const stale = withShadow.filter((t) => t.shadow.v !== SHADOW_CACHE_V).length;
+    return {
+      count: all.length,
+      shadowCount: withShadow.length,
+      staleShadow: stale,
+      bytes: all.reduce((s, t) => s + (t.blob ? t.blob.size : 0), 0),
+      shadowBytes: withShadow.reduce((s, t) => s + (t.shadow.maskPng ? t.shadow.maskPng.length : 0), 0),
+    };
+  },
+
+  /** 只清阴影分析结果，保留瓦片图（下次扫描不用重新下载） */
+  async "imagery.clearShadow"() {
+    const all = await idb.getAll("tiles").catch(() => []);
+    let n = 0;
+    for (const t of all) {
+      if (!t || !t.shadow) continue;
+      delete t.shadow;
+      await idb.put("tiles", t);
+      n += 1;
+    }
+    await bgLog("warn", "阴影缓存已清空（瓦片保留）", { tiles: n });
+    return { ok: true, cleared: n, kept: all.length };
   },
 
   async "imagery.clear"() {
