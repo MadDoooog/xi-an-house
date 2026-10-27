@@ -147,3 +147,90 @@ body {
   background: #dcfce7;
   color: #15803d;
 }
+
+.draw-actions {
+  grid-column: 1 / -1;
+  margin-top: 8px;
+}
+
+.draw-hint {
+  margin: 0 0 8px;
+  color: #b45309;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.draw-btn,
+.draw-toolbar button {
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: #fff;
+  color: #0f172a;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.draw-btn:disabled,
+.draw-toolbar button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.draw-btn,
+.draw-toolbar button.primary {
+  background: #2563eb;
+  border-color: #2563eb;
+  color: #fff;
+}
+
+.draw-toolbar {
+  position: absolute;
+  left: 50%;
+  bottom: 20px;
+  z-index: 2;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 4px 16px rgba(15, 23, 42, 0.15);
+  font-size: 13px;
+}
+
+.draw-count {
+  color: #64748b;
+}
+
+.pending-list {
+  margin-top: 16px;
+  padding: 12px;
+  border-radius: 12px;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+}
+
+.pending-list ul {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+}
+
+.pending-list button {
+  width: 100%;
+  text-align: left;
+  border: 0;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.pending-list button:hover {
+  background: #ffedd5;
+}

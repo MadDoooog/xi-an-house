@@ -36,6 +36,16 @@ class CrawlTriggerResponse(BaseModel):
     records_count: int
 
 
+class ManualBoundaryUpdate(BaseModel):
+    polygon: list[list[float]]
+
+
+class ManualBoundaryResponse(BaseModel):
+    id: int
+    boundary_source: str | None
+    vertex_count: int
+
+
 class CrawlJobOut(BaseModel):
     id: int
     source: str

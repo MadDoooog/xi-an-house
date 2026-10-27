@@ -40,6 +40,7 @@ export type SummaryStats = {
   total_communities: number;
   by_category: Record<string, number>;
   avg_display_price: number | null;
+  pending_manual: { id: number; name: string }[];
 };
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
@@ -67,3 +68,30 @@ export async function fetchSummary(): Promise<SummaryStats> {
   }
   return response.json();
 }
+
+export async function saveManualBoundary(
+  communityId: number,
+  polygon: number[][],
+): Promise<{ id: number; boundary_source: string | null; vertex_count: number }> {
+  const response = await fetch(`${API_BASE}/api/communities/${communityId}/boundary`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ polygon }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.detail || "Failed to save boundary");
+  }
+  return response.json();
+}
+
+export const BOUNDARY_SOURCE_LABELS: Record<string, string> = {
+  amap_address_aoi: "门牌号·高德 AOI",
+  amap_address_osm_polygon: "门牌号·高德点+OSM 面",
+  amap_name_aoi: "小区名·高德 AOI",
+  amap_name_osm_polygon: "小区名·高德点+OSM 面",
+  osm_road_corners: "四至道路·OSM 求交",
+  osm_road_half_planes: "四至道路·OSM 半平面",
+  pending_manual: "待手动画定",
+  manual: "手动画定",
+};

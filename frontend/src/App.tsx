@@ -1,9 +1,20 @@
+import { useState } from "react";
 import { DetailPanel, Legend, formatPrice } from "./components/Panel";
 import { MapView } from "./components/MapView";
+import { saveManualBoundary } from "./api";
 import { useCommunities } from "./hooks/useCommunities";
 
 export default function App() {
-  const { features, summary, selected, loading, error, selectCommunity } = useCommunities();
+  const { features, summary, selected, loading, error, selectCommunity, refreshGeoJson } =
+    useCommunities();
+  const [drawTargetId, setDrawTargetId] = useState<number | null>(null);
+
+  const handleSaveBoundary = async (communityId: number, polygon: number[][]) => {
+    await saveManualBoundary(communityId, polygon);
+    await refreshGeoJson();
+    await selectCommunity(communityId);
+    setDrawTargetId(null);
+  };
 
   return (
     <div className="app-shell">
@@ -25,10 +36,34 @@ export default function App() {
           </div>
         )}
         <Legend />
-        <DetailPanel detail={selected} />
+        {summary && summary.pending_manual.length > 0 && (
+          <div className="pending-list">
+            <strong>待手画边界</strong>
+            <ul>
+              {summary.pending_manual.map((item) => (
+                <li key={item.id}>
+                  <button type="button" onClick={() => void selectCommunity(item.id)}>
+                    {item.name}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        <DetailPanel
+          detail={selected}
+          isDrawing={drawTargetId != null}
+          onStartDraw={() => selected && setDrawTargetId(selected.id)}
+        />
       </aside>
       <main className="map-wrap">
-        <MapView features={features} onSelect={selectCommunity} />
+        <MapView
+          features={features}
+          onSelect={selectCommunity}
+          drawCommunityId={drawTargetId}
+          onDrawCancel={() => setDrawTargetId(null)}
+          onSaveBoundary={handleSaveBoundary}
+        />
       </main>
     </div>
   );

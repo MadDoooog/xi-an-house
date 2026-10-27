@@ -1,4 +1,5 @@
 import type { CommunityFeature } from "../api";
+import { BOUNDARY_SOURCE_LABELS } from "../api";
 
 const CATEGORY_LABELS: Record<string, string> = {
   new_home: "新房",
@@ -26,10 +27,19 @@ export function formatPrice(price: number | null | undefined) {
   return `¥${Math.round(price).toLocaleString()}/㎡`;
 }
 
+export function boundarySourceLabel(source: string | null | undefined) {
+  if (!source) return "—";
+  return BOUNDARY_SOURCE_LABELS[source] || source;
+}
+
 export function DetailPanel({
   detail,
+  isDrawing,
+  onStartDraw,
 }: {
   detail: CommunityFeature["properties"] | import("../api").CommunityDetail | null;
+  isDrawing?: boolean;
+  onStartDraw?: () => void;
 }) {
   if (!detail) {
     return (
@@ -57,7 +67,15 @@ export function DetailPanel({
           {detail.sold_ratio != null ? `${Math.round(detail.sold_ratio * 100)}%` : "—"}
         </dd>
         <dt>边界来源</dt>
-        <dd>{detail.boundary_source || "—"}</dd>
+        <dd>{boundarySourceLabel(detail.boundary_source)}</dd>
+        {isFull && detail.boundary_source === "pending_manual" && onStartDraw && (
+          <div className="draw-actions">
+            <p className="draw-hint">自动解析未成功，可在地图上手动画定边界。</p>
+            <button type="button" className="draw-btn" onClick={onStartDraw} disabled={isDrawing}>
+              {isDrawing ? "手画模式中…" : "手画边界"}
+            </button>
+          </div>
+        )}
         {isFull && (
           <>
             <dt>坐落</dt>

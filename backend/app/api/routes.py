@@ -9,12 +9,19 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.database import get_db
 from app.models import Community, CrawlJob
-from app.schemas import CommunityDetail, CrawlJobOut, CrawlTriggerResponse
+from app.schemas import (
+    CommunityDetail,
+    CrawlJobOut,
+    CrawlTriggerResponse,
+    ManualBoundaryResponse,
+    ManualBoundaryUpdate,
+)
 from app.services.pipeline import (
     bootstrap_data,
     communities_to_geojson,
     crawl_list_pages,
     re_resolve_boundaries,
+    save_manual_boundary,
     summary_stats,
 )
 
@@ -63,6 +70,27 @@ def get_community(community_id: int, db: Session = Depends(get_db)) -> Community
         status=project.status if project else None,
         published_at=project.published_at if project else None,
         metadata=community.metadata_json,
+    )
+
+
+@router.put("/communities/{community_id}/boundary", response_model=ManualBoundaryResponse)
+def update_community_boundary(
+    community_id: int,
+    body: ManualBoundaryUpdate,
+    db: Session = Depends(get_db),
+) -> ManualBoundaryResponse:
+    try:
+        community = save_manual_boundary(db, community_id, body.polygon)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Community not found") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    details = (community.metadata_json or {}).get("boundary_details") or {}
+    return ManualBoundaryResponse(
+        id=community.id,
+        boundary_source=community.boundary_source,
+        vertex_count=int(details.get("vertex_count", len(body.polygon))),
     )
 
 

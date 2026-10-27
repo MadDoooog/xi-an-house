@@ -4,7 +4,7 @@ from typing import Any
 
 import httpx
 
-MAX_AMAP_CALLS_PER_COMMUNITY = 4
+MAX_AMAP_CALLS_PER_COMMUNITY = 6
 
 
 class AmapBudgetExhausted(Exception):

@@ -10,3 +10,7 @@ frontend/dist/
 .DS_Store
 extension/tests/node_modules
 extension/tests/out/
+
+# 打包产物（用 scripts/pack_extension.sh 现打包）
+dist/
+*.code-workspace

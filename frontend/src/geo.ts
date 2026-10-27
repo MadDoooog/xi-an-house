@@ -51,8 +51,30 @@ export function wgs84ToGcj02(lng: number, lat: number): [number, number] {
   return [lng + adjLng, lat + adjLat];
 }
 
+export function gcj02ToWgs84(lng: number, lat: number): [number, number] {
+  if (outOfChina(lng, lat)) {
+    return [lng, lat];
+  }
+  let guessLng = lng;
+  let guessLat = lat;
+  for (let i = 0; i < 8; i += 1) {
+    const [mappedLng, mappedLat] = wgs84ToGcj02(guessLng, guessLat);
+    guessLng += lng - mappedLng;
+    guessLat += lat - mappedLat;
+  }
+  return [guessLng, guessLat];
+}
+
 function transformPosition(position: [number, number]): [number, number] {
   return wgs84ToGcj02(position[0], position[1]);
+}
+
+export function mapCoordToWgs84(
+  lng: number,
+  lat: number,
+  basemap: BasemapId,
+): [number, number] {
+  return basemap === "amap" ? gcj02ToWgs84(lng, lat) : [lng, lat];
 }
 
 export function transformPolygonCoordinates(

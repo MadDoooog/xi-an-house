@@ -579,6 +579,87 @@ def polygon_from_road_bounds_osm(
     return None
 
 
+def _way_element_to_polygon(way: dict[str, Any]) -> Polygon | None:
+    coords = [(node["lon"], node["lat"]) for node in way.get("geometry", [])]
+    if len(coords) < 4:
+        return None
+    if coords[0] != coords[-1]:
+        coords.append(coords[0])
+    polygon = Polygon(coords)
+    if polygon.is_empty:
+        return None
+    if not polygon.is_valid:
+        polygon = polygon.buffer(0)
+    if polygon.is_empty or polygon.geom_type != "Polygon":
+        return None
+    return polygon
+
+
+def _polygon_ring(polygon: Polygon) -> list[list[float]]:
+    return [[lng, lat] for lng, lat in polygon.exterior.coords]
+
+
+def nearest_polygon_at_point(
+    client: httpx.Client,
+    point_wgs84: list[float],
+    overpass_urls: list[str] | None = None,
+    *,
+    radii_m: tuple[int, ...] = (80, 200, 400, 800),
+) -> dict[str, Any] | None:
+    """Find the OSM polygon nearest to a WGS84 point (prefer containing, then smallest area)."""
+    lng, lat = point_wgs84
+    if not in_xian_bounds(lng, lat):
+        return None
+
+    anchor = Point(lng, lat)
+    urls = overpass_urls or DEFAULT_OVERPASS_URLS
+
+    for radius in radii_m:
+        query = f"""
+[out:json][timeout:25];
+(
+  way(around:{radius},{lat},{lng})["building"];
+  way(around:{radius},{lat},{lng})["landuse"];
+);
+out geom;
+"""
+        try:
+            payload = overpass_query(query, client, urls)
+        except Exception:  # noqa: BLE001
+            continue
+
+        candidates: list[tuple[Polygon, dict[str, Any]]] = []
+        for element in payload.get("elements", []):
+            if element.get("type") != "way":
+                continue
+            polygon = _way_element_to_polygon(element)
+            if polygon is None:
+                continue
+            candidates.append((polygon, element))
+
+        if not candidates:
+            continue
+
+        containing = [(poly, elem) for poly, elem in candidates if poly.contains(anchor)]
+        if containing:
+            best_poly, best_elem = min(containing, key=lambda item: item[0].area)
+        else:
+            best_poly, best_elem = min(candidates, key=lambda item: item[0].distance(anchor))
+
+        return {
+            "method": "osm_nearest_polygon",
+            "polygon": _polygon_ring(best_poly),
+            "center": [anchor.x, anchor.y],
+            "anchor": [anchor.x, anchor.y],
+            "osm_way_id": best_elem.get("id"),
+            "osm_tags": best_elem.get("tags", {}),
+            "search_radius_m": radius,
+            "contains_point": best_poly.contains(anchor),
+        }
+
+    return None
+
+
 def geocode_fallback_osm(
     client: httpx.Client, project_name: str, location_text: str
 ) -> dict[str, Any] | None:

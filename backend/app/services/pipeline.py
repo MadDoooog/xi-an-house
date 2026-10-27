@@ -85,6 +85,7 @@ def upsert_project(db: Session, data: dict[str, Any], boundary: dict[str, Any]) 
     community.metadata_json = {
         "confidence": boundary.get("confidence"),
         "location_text": data.get("location_text"),
+        "boundary_details": boundary.get("details"),
     }
     db.flush()
     return community
@@ -276,10 +277,18 @@ def summary_stats(db: Session) -> dict[str, Any]:
         ).all()
     )
     avg_price = db.scalar(select(func.avg(Community.display_price)))
+    pending_manual = db.scalars(
+        select(Community)
+        .where(Community.boundary_source == "pending_manual")
+        .order_by(Community.name)
+    ).all()
     return {
         "total_communities": total,
         "by_category": by_category,
         "avg_display_price": round(float(avg_price), 2) if avg_price else None,
+        "pending_manual": [
+            {"id": community.id, "name": community.name} for community in pending_manual
+        ],
     }
 
 
@@ -307,6 +316,9 @@ def re_resolve_boundaries(db: Session, settings) -> dict[str, int]:
             if not project:
                 skipped += 1
                 continue
+            if community.boundary_source == "manual":
+                skipped += 1
+                continue
             boundary = resolve_boundary(
                 map_client,
                 community.name,
@@ -327,8 +339,46 @@ def re_resolve_boundaries(db: Session, settings) -> dict[str, int]:
                     "boundary_details": boundary.get("details"),
                 }
                 updated += 1
+            elif boundary.get("boundary_source") == "pending_manual":
+                community.geom = None
+                community.boundary_source = "pending_manual"
+                community.metadata_json = {
+                    **(community.metadata_json or {}),
+                    "confidence": boundary.get("confidence"),
+                    "boundary_details": boundary.get("details"),
+                }
+                updated += 1
             else:
                 skipped += 1
             db.flush()
     db.commit()
     return {"updated": updated, "skipped": skipped, "total": updated + skipped}
+
+
+def save_manual_boundary(
+    db: Session, community_id: int, polygon_coords: list[list[float]]
+) -> Community:
+    if len(polygon_coords) < 4:
+        raise ValueError("polygon must have at least 4 coordinates")
+
+    ring = list(polygon_coords)
+    if ring[0] != ring[-1]:
+        ring.append(ring[0])
+
+    community = db.scalar(select(Community).where(Community.id == community_id))
+    if not community:
+        raise LookupError("Community not found")
+
+    community.geom = polygon_to_geom(ring)
+    shape = to_shape(community.geom)
+    center = shape.centroid
+    community.center = point_to_geom([center.x, center.y])
+    community.boundary_source = "manual"
+    community.metadata_json = {
+        **(community.metadata_json or {}),
+        "confidence": "high",
+        "boundary_details": {"priority": "manual", "vertex_count": len(ring) - 1},
+    }
+    db.commit()
+    db.refresh(community)
+    return community

@@ -1,10 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import maplibregl, { Map, Popup } from "maplibre-gl";
 import type { CommunityFeature } from "../api";
-import { BASEMAP_OPTIONS, type BasemapId, transformPolygonCoordinates } from "../geo";
+import {
+  BASEMAP_OPTIONS,
+  type BasemapId,
+  mapCoordToWgs84,
+  transformPolygonCoordinates,
+} from "../geo";
 import { formatPrice } from "./Panel";
 
 const XIAN_CENTER: [number, number] = [108.94, 34.26];
+const DRAFT_SOURCE_ID = "draw-draft";
 
 function priceColor(price: number | null, min: number, max: number) {
   if (price == null || max <= min) {
@@ -20,12 +26,24 @@ function priceColor(price: number | null, min: number, max: number) {
 type Props = {
   features: CommunityFeature[];
   onSelect: (id: number) => void;
+  drawCommunityId?: number | null;
+  onDrawCancel?: () => void;
+  onSaveBoundary?: (communityId: number, polygon: number[][]) => Promise<void>;
 };
 
-export function MapView({ features, onSelect }: Props) {
+export function MapView({
+  features,
+  onSelect,
+  drawCommunityId = null,
+  onDrawCancel,
+  onSaveBoundary,
+}: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<Map | null>(null);
   const [basemap, setBasemap] = useState<BasemapId>("osm");
+  const [draftPoints, setDraftPoints] = useState<[number, number][]>([]);
+  const [saving, setSaving] = useState(false);
+  const isDrawing = drawCommunityId != null;
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) {
@@ -82,6 +100,12 @@ export function MapView({ features, onSelect }: Props) {
     map.setLayoutProperty("amap", "visibility", basemap === "amap" ? "visible" : "none");
   }, [basemap]);
 
+  useEffect(() => {
+    if (!drawCommunityId) {
+      setDraftPoints([]);
+    }
+  }, [drawCommunityId]);
+
   const displayFeatures = useMemo(() => {
     const toGcj02 = basemap === "amap";
     return features.map((feature) => ({
@@ -136,7 +160,6 @@ export function MapView({ features, onSelect }: Props) {
 
       if (map.getSource(sourceId)) {
         (map.getSource(sourceId) as maplibregl.GeoJSONSource).setData(geojson);
-        fitToFeatures();
         return;
       }
 
@@ -211,6 +234,7 @@ export function MapView({ features, onSelect }: Props) {
       });
 
       map.on("click", fillLayerId, (event) => {
+        if (drawCommunityId != null) return;
         const feature = event.features?.[0];
         if (!feature) return;
         const props = feature.properties as CommunityFeature["properties"];
@@ -223,7 +247,111 @@ export function MapView({ features, onSelect }: Props) {
     } else {
       map.once("load", render);
     }
-  }, [displayFeatures, onSelect]);
+  }, [displayFeatures, drawCommunityId, onSelect]);
+
+  const updateDraftLayer = useCallback(
+    (points: [number, number][]) => {
+      const map = mapRef.current;
+      if (!map || !map.isStyleLoaded()) return;
+
+      const ring = points.length >= 3 ? [...points, points[0]] : points;
+      const geojson: GeoJSON.FeatureCollection = {
+        type: "FeatureCollection",
+        features:
+          points.length >= 2
+            ? [
+                {
+                  type: "Feature",
+                  properties: {},
+                  geometry: { type: "LineString", coordinates: ring },
+                },
+              ]
+            : points.length === 1
+              ? [
+                  {
+                    type: "Feature",
+                    properties: {},
+                    geometry: { type: "Point", coordinates: points[0] },
+                  },
+                ]
+              : [],
+      };
+
+      if (points.length >= 3) {
+        geojson.features.push({
+          type: "Feature",
+          properties: {},
+          geometry: { type: "Polygon", coordinates: [ring] },
+        });
+      }
+
+      if (map.getSource(DRAFT_SOURCE_ID)) {
+        (map.getSource(DRAFT_SOURCE_ID) as maplibregl.GeoJSONSource).setData(geojson);
+        return;
+      }
+
+      map.addSource(DRAFT_SOURCE_ID, { type: "geojson", data: geojson });
+      map.addLayer({
+        id: "draw-draft-fill",
+        type: "fill",
+        source: DRAFT_SOURCE_ID,
+        filter: ["==", ["geometry-type"], "Polygon"],
+        paint: { "fill-color": "#2563eb", "fill-opacity": 0.25 },
+      });
+      map.addLayer({
+        id: "draw-draft-line",
+        type: "line",
+        source: DRAFT_SOURCE_ID,
+        filter: ["==", ["geometry-type"], "LineString"],
+        paint: { "line-color": "#1d4ed8", "line-width": 2, "line-dasharray": [2, 1] },
+      });
+      map.addLayer({
+        id: "draw-draft-point",
+        type: "circle",
+        source: DRAFT_SOURCE_ID,
+        filter: ["==", ["geometry-type"], "Point"],
+        paint: { "circle-radius": 5, "circle-color": "#1d4ed8" },
+      });
+    },
+    [],
+  );
+
+  useEffect(() => {
+    updateDraftLayer(draftPoints);
+  }, [draftPoints, updateDraftLayer]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || drawCommunityId == null) return;
+
+    const handleClick = (event: maplibregl.MapMouseEvent) => {
+      setDraftPoints((prev) => [...prev, [event.lngLat.lng, event.lngLat.lat]]);
+    };
+
+    map.getCanvas().style.cursor = "crosshair";
+    map.on("click", handleClick);
+
+    return () => {
+      map.getCanvas().style.cursor = "";
+      map.off("click", handleClick);
+    };
+  }, [drawCommunityId]);
+
+  const undoDraftPoint = () => {
+    setDraftPoints((prev) => prev.slice(0, -1));
+  };
+
+  const completeDraw = async () => {
+    if (!drawCommunityId || !onSaveBoundary || draftPoints.length < 3) return;
+    setSaving(true);
+    try {
+      const wgsRing = draftPoints.map(([lng, lat]) => mapCoordToWgs84(lng, lat, basemap));
+      await onSaveBoundary(drawCommunityId, wgsRing);
+      setDraftPoints([]);
+    } finally {
+      setSaving(false);
+    }
+  };
 
   return (
     <div className="map-wrap">
@@ -239,6 +367,26 @@ export function MapView({ features, onSelect }: Props) {
           </button>
         ))}
       </div>
+      {isDrawing && (
+        <div className="draw-toolbar" role="toolbar" aria-label="手画边界">
+          <span>点击地图添加顶点（至少 3 个）</span>
+          <span className="draw-count">已选 {draftPoints.length} 点</span>
+          <button type="button" onClick={undoDraftPoint} disabled={!draftPoints.length || saving}>
+            撤销
+          </button>
+          <button
+            type="button"
+            className="primary"
+            onClick={() => void completeDraw()}
+            disabled={draftPoints.length < 3 || saving}
+          >
+            {saving ? "保存中…" : "完成并保存"}
+          </button>
+          <button type="button" onClick={onDrawCancel} disabled={saving}>
+            取消
+          </button>
+        </div>
+      )}
       <div ref={containerRef} className="map-container" />
     </div>
   );

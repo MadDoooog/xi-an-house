@@ -7,23 +7,23 @@ import httpx
 
 from app.services.amap_client import AmapBudgetExhausted, AmapClient, MAX_AMAP_CALLS_PER_COMMUNITY
 from app.services.geo import gcj02_to_wgs84, haversine_m, intersect_lines
-from app.services.osm_boundary import (
-    DEFAULT_OVERPASS_URLS,
-    geocode_fallback_osm,
-    polygon_from_road_bounds_osm,
-)
-
 from app.services.boundary_parse import (
     CORNER_ROLES,
     buffer_polygon,
+    extract_door_address,
+    has_door_number,
     has_road_bounds,
     parse_district_prefix,
     parse_road_bounds,
     polygon_centroid,
 )
+from app.services.osm_boundary import (
+    DEFAULT_OVERPASS_URLS,
+    nearest_polygon_at_point,
+    polygon_from_road_bounds_osm,
+)
 
 PHASE_PATTERN = re.compile(r"([一二三四五六七八九十\d]+)期")
-DOOR_NUMBER_PATTERN = re.compile(r"(\d+)号")
 
 ROLE_BOUNDARY_AXIS = {
     "west": "vertical",
@@ -335,34 +335,245 @@ def fetch_poi_polygon(
 
 
 def geocode_matches_request(request: str, formatted_address: str | None) -> bool:
+    from app.services.boundary_parse import DOOR_NUMBER_PATTERN
+
     requested = DOOR_NUMBER_PATTERN.search(request)
     if not requested:
         return True
     resolved = DOOR_NUMBER_PATTERN.search(formatted_address or "")
-    return bool(resolved and requested.group(1) == resolved.group(1))
+    return bool(resolved and requested.group(0) == resolved.group(0))
 
 
-def fetch_geocode_anchor(amap: AmapClient, location_text: str) -> dict[str, Any] | None:
+def fetch_amap_point(
+    amap: AmapClient, query: str, *, require_door_match: bool = False
+) -> dict[str, Any] | None:
+    """Geocode or place-search a query; return center and optional AOI polygon (GCJ-02)."""
     if amap.remaining() <= 0:
         return None
-    payload = amap.geocode(location_text)
-    geocodes = payload.get("geocodes") or []
-    if not geocodes:
+
+    geocode_payload = amap.geocode(query)
+    geocodes = geocode_payload.get("geocodes") or []
+    center: list[float] | None = None
+    geocode_meta: dict[str, Any] | None = None
+    if geocodes:
+        item = geocodes[0]
+        center = poi_location(item)
+        if center and (
+            not require_door_match
+            or geocode_matches_request(query, item.get("formatted_address"))
+        ):
+            geocode_meta = {
+                "formatted_address": item.get("formatted_address"),
+                "level": item.get("level"),
+                "location": center,
+            }
+        else:
+            center = None
+
+    polygon: list[list[float]] | None = None
+    poi_meta: dict[str, Any] | None = None
+
+    if amap.remaining() > 0:
+        place_payload = amap.place_text(query, citylimit=True, offset=5, extensions="all")
+        for poi in place_payload.get("pois") or []:
+            location = poi_location(poi)
+            if not location:
+                continue
+            if require_door_match and not geocode_matches_request(
+                query, f"{poi.get('address') or ''}{poi.get('name') or ''}"
+            ):
+                continue
+            poi_meta = {
+                "id": poi.get("id"),
+                "name": poi.get("name"),
+                "address": poi.get("address"),
+                "type": poi.get("type"),
+                "location": location,
+            }
+            center = center or location
+            polyline = poi.get("polyline")
+            if not polyline and poi.get("id") and amap.remaining() > 0:
+                detail = amap.place_detail(poi["id"])
+                detail_poi = (detail.get("pois") or [None])[0] or {}
+                polyline = detail_poi.get("polyline")
+                poi_meta["detail_type"] = detail_poi.get("type")
+            if polyline:
+                polygon = polygon_from_polyline(polyline)
+            break
+
+    if not center:
         return None
-    item = geocodes[0]
-    location = poi_location(item)
+
+    result: dict[str, Any] = {
+        "center": center,
+        "geocode": geocode_meta,
+        "poi": poi_meta,
+        "query": query,
+    }
+    if polygon:
+        result["polygon"] = polygon
+        result["source"] = "amap_aoi"
+    else:
+        result["source"] = "amap_point"
+    return result
+
+
+def fetch_poi_point(amap: AmapClient, project_name: str) -> dict[str, Any] | None:
+    """Resolve a community name to a Gaode point and optional AOI polygon (no buffer fallback)."""
+    if amap.remaining() <= 0:
+        return None
+    payload = amap.place_text(project_name, citylimit=True, offset=5, extensions="all")
+    poi = pick_project_poi(payload.get("pois") or [], project_name)
+    if not poi:
+        core = normalize_project_label(project_name)
+        if core and amap.remaining() > 0:
+            payload = amap.place_text(core, citylimit=True, offset=5, extensions="all")
+            poi = pick_project_poi(payload.get("pois") or [], project_name)
+    if not poi:
+        return None
+
+    location = poi_location(poi)
     if not location:
         return None
-    if not geocode_matches_request(location_text, item.get("formatted_address")):
-        return None
-    return {
-        "source": "geocode",
+
+    result: dict[str, Any] = {
+        "source": "amap_poi_point",
         "center": location,
-        "polygon": buffer_polygon(location),
-        "geocode": {
-            "formatted_address": item.get("formatted_address"),
-            "level": item.get("level"),
+        "poi": {
+            "id": poi.get("id"),
+            "name": poi.get("name"),
+            "address": poi.get("address"),
+            "type": poi.get("type"),
             "location": location,
+        },
+    }
+
+    polyline = poi.get("polyline")
+    if not polyline and poi.get("id") and amap.remaining() > 0:
+        detail = amap.place_detail(poi["id"])
+        detail_poi = (detail.get("pois") or [None])[0] or {}
+        polyline = detail_poi.get("polyline")
+        result["poi"]["detail_type"] = detail_poi.get("type")
+
+    if polyline:
+        polygon = polygon_from_polyline(polyline)
+        if polygon:
+            result["polygon"] = polygon
+            result["source"] = "amap_poi_aoi"
+    return result
+
+
+def _snap_amap_to_osm_polygon(
+    client: httpx.Client,
+    center_gcj02: list[float],
+    overpass_urls: list[str] | None,
+) -> dict[str, Any] | None:
+    center_wgs84 = gcj02_to_wgs84(center_gcj02[0], center_gcj02[1])
+    return nearest_polygon_at_point(
+        client,
+        center_wgs84,
+        overpass_urls or DEFAULT_OVERPASS_URLS,
+    )
+
+
+def resolve_from_door_address(
+    client: httpx.Client,
+    amap: AmapClient,
+    location_text: str,
+    overpass_urls: list[str] | None,
+) -> dict[str, Any] | None:
+    address = extract_door_address(location_text)
+    if not address:
+        return None
+
+    amap_result = fetch_amap_point(amap, address, require_door_match=True)
+    if not amap_result:
+        return None
+
+    if amap_result.get("polygon"):
+        return {
+            "boundary_source": "amap_address_aoi",
+            "confidence": "high",
+            "polygon": amap_result["polygon"],
+            "center": amap_result["center"],
+            "input_crs": "gcj02",
+            "details": {"amap": amap_result, "priority": 1},
+        }
+
+    osm_result = _snap_amap_to_osm_polygon(
+        client, amap_result["center"], overpass_urls
+    )
+    if not osm_result:
+        return None
+
+    center_wgs84 = gcj02_to_wgs84(amap_result["center"][0], amap_result["center"][1])
+    return {
+        "boundary_source": "amap_address_osm_polygon",
+        "confidence": "medium",
+        "polygon": osm_result["polygon"],
+        "center": center_wgs84,
+        "input_crs": "wgs84",
+        "details": {
+            "priority": 1,
+            "amap": amap_result,
+            "osm": osm_result,
+        },
+    }
+
+
+def resolve_from_community_name(
+    client: httpx.Client,
+    amap: AmapClient,
+    name: str,
+    overpass_urls: list[str] | None,
+) -> dict[str, Any] | None:
+    amap_result = fetch_poi_point(amap, name)
+    if not amap_result:
+        return None
+
+    if amap_result.get("polygon"):
+        return {
+            "boundary_source": "amap_name_aoi",
+            "confidence": "high",
+            "polygon": amap_result["polygon"],
+            "center": amap_result["center"],
+            "input_crs": "gcj02",
+            "details": {"amap": amap_result, "priority": 3},
+        }
+
+    osm_result = _snap_amap_to_osm_polygon(
+        client, amap_result["center"], overpass_urls
+    )
+    if not osm_result:
+        return None
+
+    center_wgs84 = gcj02_to_wgs84(amap_result["center"][0], amap_result["center"][1])
+    return {
+        "boundary_source": "amap_name_osm_polygon",
+        "confidence": "medium",
+        "polygon": osm_result["polygon"],
+        "center": center_wgs84,
+        "input_crs": "wgs84",
+        "details": {
+            "priority": 3,
+            "amap": amap_result,
+            "osm": osm_result,
+        },
+    }
+
+
+def pending_manual_result(location_text: str, name: str) -> dict[str, Any]:
+    return {
+        "boundary_source": "pending_manual",
+        "confidence": "none",
+        "center": None,
+        "polygon": None,
+        "coordinate_system": "wgs84",
+        "details": {
+            "priority": 4,
+            "reason": "automatic boundary resolution exhausted",
+            "location_text": location_text,
+            "name": name,
         },
     }
 
@@ -378,6 +589,7 @@ def resolve_boundary(
     road_fetch_delay: float = 1.0,
 ) -> dict[str, Any]:
     provider = (boundary_provider or "osm").lower()
+    urls = overpass_urls or DEFAULT_OVERPASS_URLS
     result: dict[str, Any] = {
         "boundary_source": None,
         "confidence": "low",
@@ -387,116 +599,83 @@ def resolve_boundary(
         "details": {"provider": provider},
     }
 
-    def _apply_polygon(
-        source: str,
-        confidence: str,
-        polygon: list[list[float]],
-        center: list[float] | None,
-        details: dict[str, Any],
-        *,
-        input_crs: str = "wgs84",
-    ) -> dict[str, Any]:
+    def _apply_resolved(resolved: dict[str, Any]) -> dict[str, Any]:
+        polygon = resolved["polygon"]
+        center = resolved.get("center")
+        input_crs = resolved.get("input_crs", "wgs84")
         if input_crs == "gcj02":
             polygon = [gcj02_to_wgs84(point[0], point[1]) for point in polygon]
             if center:
                 center = gcj02_to_wgs84(center[0], center[1])
         result.update(
             {
-                "boundary_source": source,
-                "confidence": confidence,
+                "boundary_source": resolved["boundary_source"],
+                "confidence": resolved["confidence"],
                 "center": center or polygon_centroid(polygon),
                 "polygon": polygon,
                 "coordinate_system": "wgs84",
-                "details": {**result["details"], **details},
+                "details": {**result["details"], **resolved.get("details", {})},
             }
         )
         return result
 
-    if provider in {"osm", "auto"} and has_road_bounds(location_text):
+    amap: AmapClient | None = None
+    if amap_key:
+        amap = AmapClient(client, amap_key, max_calls=MAX_AMAP_CALLS_PER_COMMUNITY)
+
+    # Priority 1: door-number address via Amap, snap to OSM polygon when no AOI.
+    if amap and has_door_number(location_text):
+        try:
+            door_result = resolve_from_door_address(client, amap, location_text, urls)
+            if door_result and door_result.get("polygon"):
+                result["details"]["amap_calls"] = amap.calls_used
+                result["details"]["amap_call_log"] = amap.call_log
+                return _apply_resolved(door_result)
+        except AmapBudgetExhausted:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            result["details"]["priority_1_error"] = str(exc)
+
+    # Priority 2: cardinal road bounds via OSM.
+    if has_road_bounds(location_text):
         try:
             road_result = polygon_from_road_bounds_osm(
                 client,
                 location_text,
                 project_name=name,
-                overpass_urls=overpass_urls or DEFAULT_OVERPASS_URLS,
+                overpass_urls=urls,
                 road_fetch_delay=road_fetch_delay,
             )
             if road_result and road_result.get("polygon"):
-                return _apply_polygon(
-                    road_result["method"],
-                    "medium",
-                    road_result["polygon"],
-                    road_result.get("anchor"),
-                    {"osm": road_result},
+                return _apply_resolved(
+                    {
+                        "boundary_source": road_result["method"],
+                        "confidence": "medium",
+                        "polygon": road_result["polygon"],
+                        "center": road_result.get("anchor"),
+                        "input_crs": "wgs84",
+                        "details": {"priority": 2, "osm": road_result},
+                    }
                 )
         except Exception as exc:  # noqa: BLE001
-            result["details"]["osm_error"] = str(exc)
+            result["details"]["priority_2_error"] = str(exc)
 
-    if provider in {"amap", "auto"} and amap_key:
-        amap = AmapClient(client, amap_key, max_calls=MAX_AMAP_CALLS_PER_COMMUNITY)
+    # Priority 3: community name via Amap point, snap to OSM polygon when no AOI.
+    if amap and name:
         try:
-            if has_road_bounds(location_text):
-                road_result = polygon_from_road_bounds(amap, location_text)
-                if road_result and road_result.get("polygon"):
-                    polygon = road_result["polygon"]
-                    return _apply_polygon(
-                        road_result["method"],
-                        "medium",
-                        polygon,
-                        polygon_centroid(polygon),
-                        {
-                            "amap_calls": amap.calls_used,
-                            "amap_call_log": amap.call_log,
-                            "roads": road_result,
-                        },
-                        input_crs="gcj02",
-                    )
-
-            poi_result = fetch_poi_polygon(amap, name)
-            if poi_result and poi_result.get("polygon"):
-                confidence = "high" if poi_result["source"] == "poi_aoi" else "medium"
-                return _apply_polygon(
-                    poi_result["source"],
-                    confidence,
-                    poi_result["polygon"],
-                    poi_result.get("center"),
-                    {
-                        "amap_calls": amap.calls_used,
-                        "amap_call_log": amap.call_log,
-                        "poi": poi_result,
-                    },
-                    input_crs="gcj02",
-                )
-
-            if amap.remaining() > 0:
-                geocode_result = fetch_geocode_anchor(amap, location_text)
-                if geocode_result and geocode_result.get("polygon"):
-                    return _apply_polygon(
-                        geocode_result["source"],
-                        "low",
-                        geocode_result["polygon"],
-                        geocode_result["center"],
-                        {
-                            "amap_calls": amap.calls_used,
-                            "amap_call_log": amap.call_log,
-                            "geocode": geocode_result,
-                        },
-                        input_crs="gcj02",
-                    )
+            name_result = resolve_from_community_name(client, amap, name, urls)
+            if name_result and name_result.get("polygon"):
+                result["details"]["amap_calls"] = amap.calls_used
+                result["details"]["amap_call_log"] = amap.call_log
+                return _apply_resolved(name_result)
         except AmapBudgetExhausted:
             pass
+        except Exception as exc:  # noqa: BLE001
+            result["details"]["priority_3_error"] = str(exc)
+
+    if amap:
         result["details"]["amap_calls"] = amap.calls_used
         result["details"]["amap_call_log"] = amap.call_log
 
-    if provider in {"osm", "auto"} and not has_road_bounds(location_text):
-        geocode_result = geocode_fallback_osm(client, name, location_text)
-        if geocode_result and geocode_result.get("polygon"):
-            return _apply_polygon(
-                geocode_result["method"],
-                "low",
-                geocode_result["polygon"],
-                geocode_result.get("center"),
-                {"osm": geocode_result},
-            )
-
-    return result
+    # Priority 4: leave for manual configuration in the UI.
+    return pending_manual_result(location_text, name)

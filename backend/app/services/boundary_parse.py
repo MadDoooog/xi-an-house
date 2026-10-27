@@ -80,6 +80,27 @@ def has_road_bounds(location_text: str) -> bool:
     return any(token in location_text for token in ("以东", "以西", "以南", "以北"))
 
 
+DOOR_NUMBER_PATTERN = re.compile(r"\d+号(?:院|楼|商铺|小区)?")
+
+
+def has_door_number(location_text: str) -> bool:
+    return bool(DOOR_NUMBER_PATTERN.search(location_text or ""))
+
+
+def extract_door_address(location_text: str) -> str | None:
+    """Return an address fragment suitable for Amap geocode when a door number is present."""
+    text = (location_text or "").strip()
+    if not has_door_number(text):
+        return None
+    # Prefer the clause before cardinal road-bound phrases.
+    parts = re.split(
+        r"(?=[^，,、]+(?:路|街|大道|巷)(?:以东|以西|以南|以北))",
+        text,
+    )
+    candidate = (parts[0] if parts else text).strip("，,、 ")
+    return candidate or text
+
+
 def polygon_centroid(polygon: list[list[float]]) -> list[float]:
     ring = polygon[:-1] if polygon and polygon[0] == polygon[-1] else polygon
     lngs = [point[0] for point in ring]

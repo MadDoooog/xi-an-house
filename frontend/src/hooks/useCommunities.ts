@@ -34,6 +34,11 @@ export function useCommunities() {
     }
   };
 
+  const refreshGeoJson = async () => {
+    const geojson = await fetchGeoJson();
+    setFeatures((geojson.features || []) as CommunityFeature[]);
+  };
+
   return {
     features,
     summary,
@@ -41,6 +46,7 @@ export function useCommunities() {
     loading,
     error,
     selectCommunity,
+    refreshGeoJson,
     clearSelection: () => setSelected(null),
   };
 }
