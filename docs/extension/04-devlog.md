@@ -543,107 +543,105 @@ Web 服务 REST 的 id 是同一套（金辉·高新云璟 = `B0FFIW5PO3`，两�
 
 ---
 
-## 18. 交接快照（v0.14.0）
+## 18. 交接快照（截至 v0.15.7）
 
-### 18.1 现在跑通的链路
+### 18.1 当前链路（唯一一条）
 
 ```
-设目的地（面板/右键）
-      ↓  保存时触发（hook-shim 包了 chrome.runtime.sendMessage 侦测 settings.set / community.put）
-scan.plan   整圆瓦片（不裁半径，太多就降 zoom），z18→z12
+目的地（面板「编辑」或右键取点）
+      ↓  保存时触发（lib/hook-shim.js 侦测 settings.set）
+圆心 = 所有目的地中点（GCJ）    半径 = max(目的地到圆心距离) + radiusKm×1000
       ↓
-scan.tile   逐张瓦片 → lib/shadow.js 分析 → 返回 maskPng（256×256 红色掩膜）
-      ↓       掩膜按瓦片贴图（slippymap.setMaskTiles），比凸包精确
-路网         Overpass 折线 → destination-out 擦 26 m 走廊（只切不画）
+poi.around
+  ├─ 若已开着 amap.com 页 → 站内 RQBXY（带 shape_region → 外接矩形）
+  └─ 否则立即用 Web 服务 place/around（只有点位，1 秒内返回）
       ↓
-聚类         lib/shadow-clusters.js：1/4 分辨率累加 → 4 连通域 → Moore 轮廓 → DP 简化
+community.put / community.patch（同名更新）
       ↓
-命名         poi.nearby（高德 Web 服务，types=120302）→ pickPoi 剔除子设施取最近
+post('data-changed') → ui.js 刷新列表
       ↓
-边界         poi.polygon → 站内 getPoiDetail → data.spec.mining_shape.shape
-      ↓        成功=amap-getPoiDetail；失败回退=shadow-cluster（阴影轮廓）
-落库         community.put({name, footprint, footprintSource, sources:['poi']})
-      ↓
-面板         post('data-changed') → ui.js reloadData() → 列表刷新
+（异步）poi.aroundBoxes → 开一个后台高德标签页 → 取 shape_region
+      ↓  成功：回填 community.bbox → map.setRects → 重画
+      ↓  失败：状态行写原因（blocked / cooldown / no-tab），15s/3s 后关标签页
 ```
+
+**阴影识别已废弃**：`lib/shadow.js`、`lib/shadow-clusters.js`、`background.scan.*` 仍留在仓库里，
+但地图页**不再加载**，也不要再往里加逻辑。注入版「发现」页理论上还能调 `scan.plan/scan.tile`，
+但那条路已经不在产品方向上。
 
 ### 18.2 文件地图（extension/app）
 
-| 文件 | 职责 | 改动风险 |
+| 文件 | 职责 | 风险 |
 |---|---|---|
-| `map.html` | 只有 `#map` + 脚本加载顺序 | 低（顺序：geo → logger → imagery → slippymap → shadow-clusters → hook-shim → content/ui.js） |
-| `lib/hook-shim.js` | 冒充 map-hook，让 `content/ui.js` 以为自己挂在高德上；负责阴影扫描/聚类/POI/边界 | **高**，改这里最容易连锁 |
-| `lib/slippymap.js` | 自绘 GCJ 瓦片底图 + 掩膜 + 路网剪切 + 小区多边形 | 中 |
-| `lib/shadow.js` | 单瓦片阴影分析（p95 参考 → ratio → 开运算 → 平滑 → maskRgba） | 中，改了要升 `SHADOW_CACHE_V` |
-| `lib/shadow-clusters.js` | 掩膜累加 + 连通域 + 轮廓跟踪 + DP 简化 | 中 |
-| `content/ui.js` | **注入版和地图页共用**的侧栏（列表/详情/录入/设置/canvas 叠加） | 高（两边都受影响） |
-| `background.js` | RPC 总入口：scan.plan/scan.tile/scan.roads/poi.nearby/poi.polygon/imagery.* | 中 |
+| `map.html` | 只有 `#map` + 脚本顺序：geo → logger → imagery → slippymap → hook-shim → content/ui.js | 低 |
+| `lib/hook-shim.js` | 冒充地图钩子让 `content/ui.js` 跑起来；负责圆计算、周边查询、写库、矩形 | **高** |
+| `lib/slippymap.js` | 自绘 GCJ 瓦片底图（卫星/经典）、小区矩形、圆、标记 | 中 |
+| `content/ui.js` | 注入版和地图页**共用**的侧栏（列表/详情/录入/设置） | **高**，两边都受影响 |
+| `background.js` | RPC：`poi.around` / `poi.aroundBoxes` / `poi.diag` / `poi.polygon` / `community.*` / `imagery.*` / `scan.*` | 中 |
+| `options/` | 设置页：高德 key、后台标签页开关、缓存清理、日志 | 低 |
 
 ### 18.3 关键约束（新 agent 必读）
 
-1. **坐标系**：库内一律 WGS84；瓦片/多边形/POI 一律 GCJ-02。
-   - 右键复制输出 **GCJ-02**（粘回高德才对），`parseCoords` 按 GCJ 解析再转 WGS84 入库。
-   - `slippymap` 的 `project/center` 全部按 GCJ 理解。
-2. **高德站内接口有反爬**：`www.amap.com/service/poiInfo`、`amap-pc-ssr.amap.com/ssr/api/getPoiDetail`
-   需要站点 JS 生成的 `bx-ua`/`x-dc` 指纹头，裸请求返回 HTML 或 `FAIL_SYS_USER_VALIDATE`。
-   只能在**真实 amap 标签页的 MAIN world** 里发 XHR（`chrome.scripting.executeScript({world:'MAIN'})`）。
-   无头/机房 IP 会被直接判定为验证码，**本地无法端到端验证这条路径**。
-3. **阴影缓存带版本号**：`SHADOW_CACHE_V`（background.js）。改算法/改绘制就 +1，旧缓存自动失效。
-   另有 `settings.ratio` 与请求不一致时重算的逻辑。
-4. **扫描不能裁半径**：`scan.plan` 按圆算全部瓦片，瓦片数超 `maxTiles` 时**降 zoom**，不缩半径。
-5. **路网只切不画**：`setRoadCuts()` 存折线，画掩膜时 `destination-out` 擦走廊；`setLines` 是死代码。
-6. **侧栏是复用的**：地图页直接跑 `content/ui.js`，通过 `window.postMessage({__xat:'main'|'ui'})`
-   与 `hook-shim` 通信。协议与 `content/map-hook.js` 一致，改一边要同步另一边。
+1. **坐标系**：库内 WGS84；瓦片/POI/bbox 一律 GCJ-02。
+   右键复制输出 **GCJ**，`parseCoords` 按 GCJ 解析后转 WGS84 入库。
+2. **高德站内接口的反爬**：`www.amap.com/service/poiInfo` 与
+   `amap-pc-ssr.amap.com/ssr/api/getPoiDetail` 需要站点 JS 生成的 `bx-ua`/`x-dc` 指纹头。
+   裸请求（任何 UA、任何域名）都返回 HTML 或 `FAIL_SYS_USER_VALIDATE`；
+   **只能在真实 amap 标签页的 MAIN world 里发 XHR**（`chrome.scripting.executeScript` 的 `world:'MAIN'`）。
+   机房/无头 IP 必被拦，**这条路上无法在本地端到端验证**。
+3. **`shape_region` 是外接矩形**（`minLng,minLat,maxLng,maxLat`），不是多边形；
+   多边形只有 `getPoiDetail` 的 `mining_shape.shape`（`poi.polygon` 已实现，未接入主流程）。
+4. **主查询绝不能自己开标签页**：开标签页只允许发生在后台补矩形那一步，否则会出现
+   「点了保存、界面卡住、还弹出一个标签页」。
+5. **`settings.amapTabForBoxes` 有历史包袱**：v0.15.3 默认 false 写过库，
+   v0.15.7 用 `migrateBoxTab()` + `boxTabMigratedTo=156` 迁移成 true。别再改默认值而不迁移。
+6. **service worker 顶层不能调用依赖 `const idb` 的函数**：`idb` 在文件中部定义，
+   顶层调用会在模块求值阶段 `ReferenceError`，表现为**所有 RPC 超时**。
 
-### 18.4 已知缺陷
+### 18.4 已知缺陷 / 别扭的地方
 
-- 聚类质心落在阴影上，POI 匹配是「最近的小区」，**密集区可能张冠李戴**（可用 `footprint` 人工修正，未做）。
-- `poi.polygon` 每查一次要发一次站内请求，12 片 ≈ 20 秒额外开销；被拦两次后本会话熔断。
-- 阴影阈值 `SHADOW_RATIO = 0.26` 是**按西安这一批影像定的**，换季节/换城市要重调。
-- 掩膜是逐像素的，小区边界来自高德；两者叠在一起时，阴影挖洞用的是**聚类轮廓**（不是高德边界），
-  可能留一点边角。
-- POI 不带价格/面积，列表里显示「未录入」，默认落在「不符合过滤」里。
+- 矩形要开一个高德标签页才有；不开就只有点位。用户明确觉得「别扭」。
+- 站内接口被拦后冷却 10 分钟，期间只能拿点位。
+- `city` 固定 `610100`（西安主城），查咸阳等地不对。
+- 结果上限 25 条、半径上限 5 km，没有翻页。
+- 列表里 POI 小区没有价格/面积，默认落在「不符合过滤」里。
+- 同名小区靠字符串匹配更新，改名或括号差异会重复。
 
-### 18.5 TODO（按优先级）
+### 18.5 TODO
 
 **P0**
-- [ ] 在真实浏览器验证 `poi.polygon` 是否真的拿到 `mining_shape`（看日志「拿到小区边界」），
-      并确认 `footprintSource = amap-getPoiDetail`。
-- [ ] 小区边界与阴影挖洞统一：拿到高德边界后，用**高德边界**而不是聚类轮廓去挖阴影。
-- [ ] 人工修正入口：点小区 → 拖动/重画多边形 → 存回 `community.footprint`。
+- [ ] 让矩形不依赖标签页：研究 `poi.polygon`（`mining_shape` 真多边形）能否复用同一条会话；
+      或退一步，用 Web 服务的 POI 点 + 固定半径画方块（明确标注"近似"）。
+- [ ] 取消「后台开标签页」时给出显式开关与说明（面板内，而不是只有设置页）。
+- [ ] `city` 按圆心反查 adcode（`restapi` 逆地理编码），别再写死 610100。
 
 **P1**
-- [ ] 聚类质心改为「阴影指向小区」的匹配（用 footprint 中心 + POI 中心双向校验）。
-- [ ] 一次扫描只查面积最大的前 N 片（减少站内请求与 POI 配额消耗）。
-- [ ] 结果列表区分「POI 发现」与「手工录入」，给个一键清空发现项。
+- [ ] 分页：半径 >2 km 时翻 2–3 页，突破 25 条上限。
+- [ ] 结果里区分「高德 POI」与「人工录入」，给个批量清空。
+- [ ] 详情页「边界多边形」一栏接 `poi.polygon`，手动点才查。
 
 **P2**
-- [ ] 删除注入版遗留：`content/map-hook.js` 的右键菜单注入、`scan.roads` 的老渲染路径。
-- [ ] 阴影阈值做成面板滑杆（`SHADOW_RATIO` 目前是常量）。
-- [ ] 底图缓存清理按钮已做（设置页），可以考虑加「只清某区域」。
+- [ ] 删除阴影相关死代码（`lib/shadow.js`、`lib/shadow-clusters.js`、`scan.*`、`imagery.*` 的旧路径）。
+- [ ] `loadCommunitySat` / `renderSatInto` 已是死代码，可删。
 
-### 18.6 验证方法（本仓库惯例）
+### 18.6 验证方法
 
 ```bash
-# 语法
-node --check extension/app/lib/hook-shim.js
+node --check extension/app/background.js
 for f in extension/app/lib/*.js extension/app/content/*.js; do node --check "$f"; done
 
-# 无头跑地图页（扩展 ID 由路径决定，换目录要改）
 CHROME=~/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome
 $CHROME --headless=new --no-sandbox --disable-gpu --window-size=1440,900 \
   --user-data-dir=/tmp/prof --remote-debugging-port=9333 \
   --disable-extensions-except=$PWD/extension/app --load-extension=$PWD/extension/app \
-  "chrome-extension://boodepmkkopchbjeepbkifbhbjcachfb/map.html"
+  "chrome-extension://<扩展ID>/map.html"     # 扩展 ID 由加载目录绝对路径决定
 
-# 打包 + 部署到 Windows D 盘
-bash scripts/pack_extension.sh
-python3 -c "import zipfile;zipfile.ZipFile('dist/xian-commute-ext-v0.14.0.zip').extractall('/mnt/d')"
+bash scripts/pack_extension.sh                # → dist/xian-commute-ext-v<ver>.zip
 ```
 
-- 扩展 ID 由**加载目录的绝对路径**决定，换目录会变，IndexedDB 也会跟着变。
-- 替换 `D:\xian-commute-ext` 后必须在 `chrome://extensions` 点刷新，否则旧的 service worker 继续跑，
-  会出现「新旧两版同时生效」的假象。
+面板里有两个自检入口：**发现页 → 诊断站内接口**（返回 ok/原因/响应头 160 字符）、
+**设置页 → 卫星/阴影缓存**（瓦片数、含阴影数、过期数）。
+替换 `D:\xian-commute-ext` 后必须在 `chrome://extensions` 点刷新，否则跑的是旧 SW。
 
 ---
 
