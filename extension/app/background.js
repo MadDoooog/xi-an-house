@@ -117,7 +117,7 @@ const DEFAULT_SETTINGS = {
   key: "main",
   amapKey: DEFAULT_AMAP_KEY,
   // 是否允许后台开一个高德标签页去取小区外接矩形（默认不打扰）
-  amapTabForBoxes: false,
+  amapTabForBoxes: true,
   // 默认空：目的地由你右键复制地址后粘贴添加
   destinations: [],
   destinationCount: 0,
@@ -230,6 +230,15 @@ function parsePolygonString(v) {
 
 
 /** 在真实高德标签页的 MAIN world 发请求（站点 JS 会补 bx-ua/x-dc 指纹头） */
+/** 关掉我们开的后台标签页（delay 毫秒后） */
+function closeTabSoon(delay) {
+  clearTimeout(polyTabTimer);
+  polyTabTimer = setTimeout(() => {
+    if (polyTabId != null) chrome.tabs.remove(polyTabId).catch(() => {});
+    polyTabId = null;
+  }, delay);
+}
+
 async function amapInternalFetch(url, opts) {
   const allowCreateTab = !!(opts && opts.allowCreateTab);
   if (polyBlocked >= 2) return { ok: false, reason: "blocked-session" };
@@ -299,13 +308,10 @@ async function amapInternalFetch(url, opts) {
       polyBlocked += 1;
       polyCooldownUntil = Date.now() + 10 * 60 * 1000;
       await bgLog("warn", "高德站内接口被拦", { status: r.status, head: text.slice(0, 100) });
+      closeTabSoon(3000);
       return { ok: false, reason: "blocked", status: r.status, head: text.slice(0, 160) };
     }
-    clearTimeout(polyTabTimer);
-    polyTabTimer = setTimeout(() => {
-      if (polyTabId != null) chrome.tabs.remove(polyTabId).catch(() => {});
-      polyTabId = null;
-    }, 15000);
+    closeTabSoon(15000);
     return { ok: true, text };
   } catch (e) {
     await bgLog("warn", "高德站内接口失败", { error: String(e) });
@@ -959,7 +965,8 @@ const handlers = {
 
     const tabs = await chrome.tabs.query({ url: "https://www.amap.com/*" }).catch(() => []);
     const allowTab = !!settings.amapTabForBoxes;
-    const siteTried = (tabs.length > 0 || allowTab) && Date.now() >= polyCooldownUntil;
+    // 主查询只复用「已经打开的」高德页；开新标签页留给后台补矩形，避免又一次卡住
+    const siteTried = tabs.length > 0 && Date.now() >= polyCooldownUntil;
     let siteReason = null;
 
     if (siteTried) {
@@ -970,7 +977,7 @@ const handlers = {
         "&keywords=" + encodeURIComponent(keywords) +
         "&longitude=" + lng.toFixed(6) + "&latitude=" + lat.toFixed(6) +
         "&range=" + r + "&city=" + encodeURIComponent(city);
-      const internal = await amapInternalFetch(url, { allowCreateTab: allowTab });
+      const internal = await amapInternalFetch(url, { allowCreateTab: false });
       if (internal.ok) {
         try {
           const json = JSON.parse(internal.text);

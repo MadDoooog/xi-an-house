@@ -241,11 +241,15 @@
       if (added || updated) post("data-changed", { added, updated });
 
       if (res.source !== "amap-site") {
+        const allowTab = !!(settings && settings.amapTabForBoxes);
         setBoxStatus(
-          res.siteReason === "no-tab"
-            ? "外接矩形：没有（没开高德页面；开一个 amap.com 标签页再保存即可）"
-            : `外接矩形：没有（站内接口 ${res.siteReason || "不可用"}）`,
+          allowTab
+            ? "外接矩形：后台补充中…（会短暂打开一个高德标签页）"
+            : "外接矩形：没有（设置里关掉了后台标签页，也没有开着 amap.com）",
         );
+        if (allowTab) {
+          enrichBoxes(circle, res.range || Math.round(circle.radius), byName, true).catch(() => {});
+        }
       }
       return { added, total: pois.length, source: res.source };
     } catch (e) {
