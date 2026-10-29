@@ -763,3 +763,26 @@ Web 服务回退路径没有 `shape_region`，所以那种情况下只有点位�
 
 **行为说明**：目的地上次留下的、小区列表上次留下的都是 IndexedDB 持久化（刻意设计）；
 打开页面会自动按圆心查一次，已有小区走更新而不是新增。想要矩形，请开着一个 amap.com 标签页。
+
+---
+
+## 23. v0.15.4 站内接口优先（带矩形），失败才回退
+
+**用户指出**：`poiInfo` 的 RQBXY 返回 `shape_region`，而 REST `place/around` 永远没有这个字段。
+所以顺序改回来：
+
+```
+有高德标签页（或设置允许后台开）→ 站内 RQBXY（带 shape_region）→ 有矩形
+                ↓ 没有标签页 / 被拦 / 超时
+            Web 服务 place/around → 只有点位
+```
+
+- `shape_region` = 4 个数的外接矩形（`minLng,minLat,maxLng,maxLat`），不是多边形；
+  有的 POI 没有这个字段（实测 16 条里 11 条有）。
+- 站内这条加了硬约束：**等标签页 `status==='complete'` 再注入**（最多 12 秒）、
+  被拦后 1.6 秒重试一次、失败**冷却 10 分钟**（`polyCooldownUntil`），
+  避免每次保存都白等。
+- 面板「发现」页会显示一行状态：
+  `已按圆心查询：N 个小区（半径 R m）· 来源 站内/Web 服务 · 带矩形 N 个`，
+  拿不到时提示具体原因（`no-tab` / `blocked` / `cooldown`）。
+- 矩形现在直接用**本次返回**的 bbox 画（`rectMap`），不再依赖补丁式 enrich。

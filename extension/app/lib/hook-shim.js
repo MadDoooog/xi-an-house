@@ -163,6 +163,11 @@
         keywords: "小区",
       });
       const pois = res.pois || [];
+      const boxCount = pois.filter((p) => Array.isArray(p.bbox)).length;
+      setBoxStatus(
+        `已按圆心查询：${pois.length} 个小区（半径 ${res.range || Math.round(circle.radius)} m）· ` +
+          `来源 ${res.source === "amap-site" ? "站内" : "Web 服务"} · 带矩形 ${boxCount} 个`,
+      );
       post("hook-log", {
         level: "info",
         msg: "周边小区查询完成",
@@ -221,17 +226,27 @@
         }
       }
 
-      // 先画库里已有的矩形（Web 服务没有 shape_region）
-      let rects = [...byName.values()]
-        .filter((c) => Array.isArray(c.bbox) && c.bbox.length === 4)
-        .map((c) => ({ name: c.name, bbox: c.bbox }));
+      // 矩形：本次返回的（站内接口） + 库里已存的
+      const rectMap = new Map();
+      for (const c of byName.values()) {
+        if (Array.isArray(c.bbox) && c.bbox.length === 4) rectMap.set(c.name, c.bbox);
+      }
+      for (const p of pois) {
+        if (Array.isArray(p.bbox) && p.bbox.length === 4) rectMap.set(p.name, p.bbox);
+      }
+      const rects = [...rectMap.entries()].map(([name, bbox]) => ({ name, bbox }));
       map.setRects(rects);
 
       post("hook-log", { level: "info", msg: "周边小区已写入面板", data: { added, updated, total: pois.length, rects: rects.length } });
       if (added || updated) post("data-changed", { added, updated });
 
-      // 后台补矩形：站内接口一次带回整页 shape_region，失败就算了
-      enrichBoxes(circle, res.range || Math.round(circle.radius), byName, settings && settings.amapTabForBoxes).catch(() => {});
+      if (res.source !== "amap-site") {
+        setBoxStatus(
+          res.siteReason === "no-tab"
+            ? "外接矩形：没有（没开高德页面；开一个 amap.com 标签页再保存即可）"
+            : `外接矩形：没有（站内接口 ${res.siteReason || "不可用"}）`,
+        );
+      }
       return { added, total: pois.length, source: res.source };
     } catch (e) {
       post("hook-log", { level: "warn", msg: "周边小区查询失败", data: { error: String(e) } });
@@ -269,10 +284,35 @@
         map.setRects(rects);
         post("data-changed", { rects: rects.length });
       }
-      post("hook-log", { level: "info", msg: "外接矩形补充", data: { ok, boxes: ok ? boxes.boxes.length : 0 } });
+      post("hook-log", { level: "info", msg: "外接矩形补充", data: { ok, boxes: ok ? boxes.boxes.length : 0, reason: boxes && boxes.reason } });
+      setBoxStatus(
+        ok
+          ? `外接矩形：已补 ${rects.length} 个`
+          : boxes && boxes.reason === "no-tab"
+            ? "外接矩形：没拿到（需要开着一个 amap.com 页面，或在设置里允许后台标签页）"
+            : `外接矩形：没拿到（${(boxes && boxes.reason) || "被拦截"}）`,
+      );
     } catch (e) {
       post("hook-log", { level: "warn", msg: "外接矩形补充失败", data: { error: String(e) } });
+      setBoxStatus(`外接矩形：没拿到（${e.message || e}）`);
     }
+  }
+
+  /** 把一行状态写进侧栏「发现」页（Shadow DOM 里的 #xat-scan-out） */
+  function setBoxStatus(text) {
+    try {
+      const root = document.getElementById("xat-root");
+      const box = root && root.shadowRoot && root.shadowRoot.querySelector("#xat-scan-out");
+      if (!box) return;
+      let el = box.querySelector(".xat-box-status");
+      if (!el) {
+        el = document.createElement("p");
+        el.className = "hint xat-box-status";
+        el.style.marginTop = "6px";
+        box.appendChild(el);
+      }
+      el.textContent = text;
+    } catch { /* 忽略 */ }
   }
 
   // 「保存设置 / 新增小区」之后才查（不保存不计算）

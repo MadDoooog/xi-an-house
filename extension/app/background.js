@@ -233,8 +233,11 @@ function parsePolygonString(v) {
 async function amapInternalFetch(url, opts) {
   const allowCreateTab = !!(opts && opts.allowCreateTab);
   if (polyBlocked >= 2) return { ok: false, reason: "blocked-session" };
+  if (Date.now() < polyCooldownUntil) return { ok: false, reason: "cooldown" };
+
+  let tab = null;
   const tabs = await chrome.tabs.query({ url: "https://www.amap.com/*" });
-  let tab = tabs.find((t) => t.id != null);
+  tab = tabs.find((t) => t.id != null) || null;
   if (!tab && polyTabId != null) {
     try {
       tab = await chrome.tabs.get(polyTabId);
@@ -243,19 +246,26 @@ async function amapInternalFetch(url, opts) {
     }
   }
   if (!tab) {
-    // 默认不开新标签页（会在标签栏里弹出来、还挡着用户）。
+    // 默认不开新标签页（会在标签栏里弹出来）。
     // 需要「外接矩形」时，请自己开着一个 amap.com 页面，或打开设置里的开关。
     if (!allowCreateTab) return { ok: false, reason: "no-tab" };
     tab = await chrome.tabs.create({ url: "https://www.amap.com/", active: false });
     polyTabId = tab.id;
-    await new Promise((r) => setTimeout(r, 3500));
   }
-  clearTimeout(polyTabTimer);
-  polyTabTimer = setTimeout(() => {
-    if (polyTabId != null) chrome.tabs.remove(polyTabId).catch(() => {});
-    polyTabId = null;
-  }, 15000);
-  try {
+
+  // 等页面自己加载完再注入：高德的指纹 SDK 是异步装的，注入太早会没有反爬头
+  const deadline = Date.now() + 12000;
+  while (Date.now() < deadline) {
+    try {
+      const t = await chrome.tabs.get(tab.id);
+      if (t && t.status === "complete") break;
+    } catch {
+      return { ok: false, reason: "tab-gone" };
+    }
+    await new Promise((r) => setTimeout(r, 400));
+  }
+
+  const inject = async () => {
     const [out] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       world: "MAIN",
@@ -271,14 +281,31 @@ async function amapInternalFetch(url, opts) {
         }),
       args: [url],
     });
-    const r = (out && out.result) || {};
-    const text = String(r.text || "");
-    const blocked = !text || /rgv587|punish|FAIL_SYS_USER_VALIDATE/i.test(text);
+    return (out && out.result) || {};
+  };
+
+  try {
+    let r = await inject();
+    let text = String(r.text || "");
+    let blocked = !text || /rgv587|punish|FAIL_SYS_USER_VALIDATE/i.test(text);
+    if (blocked) {
+      // 站点刚起来时偶尔会判一次，等一下再试一次
+      await new Promise((res) => setTimeout(res, 1600));
+      r = await inject();
+      text = String(r.text || "");
+      blocked = !text || /rgv587|punish|FAIL_SYS_USER_VALIDATE/i.test(text);
+    }
     if (blocked) {
       polyBlocked += 1;
+      polyCooldownUntil = Date.now() + 10 * 60 * 1000;
       await bgLog("warn", "高德站内接口被拦", { status: r.status, head: text.slice(0, 100) });
       return { ok: false, reason: "blocked", status: r.status };
     }
+    clearTimeout(polyTabTimer);
+    polyTabTimer = setTimeout(() => {
+      if (polyTabId != null) chrome.tabs.remove(polyTabId).catch(() => {});
+      polyTabId = null;
+    }, 15000);
     return { ok: true, text };
   } catch (e) {
     await bgLog("warn", "高德站内接口失败", { error: String(e) });
@@ -447,6 +474,8 @@ const SHADOW_CACHE_V = 2;
 
 // 站内 poiInfo 的反爬状态：被拦两次就本次会话不再尝试，避免拖慢扫描
 let polyBlocked = 0;
+// 被拦之后冷却 10 分钟，避免每次保存都白等一轮
+let polyCooldownUntil = 0;
 let polyTabId = null;
 let polyTabTimer = null;
 
@@ -917,15 +946,58 @@ const handlers = {
   },
 
   /**
-   * 周边小区：Web 服务 place/around（快、稳、不需登录态）。
-   * 站内接口只用来「补外接矩形」，见 poi.aroundBoxes。
+   * 周边小区。优先级：
+   *   1) 站内 RQBXY —— 带 shape_region（外接矩形），但需要真实高德标签页 + 反爬头；
+   *   2) Web 服务 place/around —— 稳定但只有点位。
+   * 有高德标签页（或设置允许后台开）时才走 1；站内这条最多等 12 秒，超时/被拦立刻回退。
    */
   async "poi.around"({ lng, lat, range = 1000, keywords = "小区", city = "610100", pagesize = 25 } = {}) {
     if (!Number.isFinite(lng) || !Number.isFinite(lat)) throw new Error("缺少圆心坐标");
     const requested = Math.round(Number(range) || 0);
     const r = Math.max(100, Math.min(5000, requested));
-    const s = normalizeSettings(await idb.get("settings", "main"));
-    const key = String(s.amapKey || "").trim() || DEFAULT_AMAP_KEY;
+    const settings = normalizeSettings(await idb.get("settings", "main"));
+
+    const tabs = await chrome.tabs.query({ url: "https://www.amap.com/*" }).catch(() => []);
+    const allowTab = !!settings.amapTabForBoxes;
+    const siteTried = (tabs.length > 0 || allowTab) && Date.now() >= polyCooldownUntil;
+    let siteReason = null;
+
+    if (siteTried) {
+      const url =
+        "https://www.amap.com/service/poiInfo?query_type=RQBXY&pagesize=" + pagesize + "&pagenum=1" +
+        "&qii=true&cluster_state=5&need_utd=true&utd_sceneid=1000&div=PC1000" +
+        "&addr_poi_merge=true&is_classify=true&zoom=17.5" +
+        "&keywords=" + encodeURIComponent(keywords) +
+        "&longitude=" + lng.toFixed(6) + "&latitude=" + lat.toFixed(6) +
+        "&range=" + r + "&city=" + encodeURIComponent(city);
+      const internal = await amapInternalFetch(url, { allowCreateTab: allowTab });
+      if (internal.ok) {
+        try {
+          const json = JSON.parse(internal.text);
+          const list = (json.data && json.data.poi_list) || [];
+          const pois = list.map(normalizeSitePoi).filter(Boolean);
+          if (pois.length) {
+            const withBox = pois.filter((p) => p.bbox).length;
+            await bgLog("info", "周边小区（站内）", { count: pois.length, boxes: withBox, range: r });
+            return {
+              ok: true, source: "amap-site", range: r, requested, clamped: requested > r,
+              count: pois.length, boxes: withBox, pois,
+            };
+          }
+          siteReason = "empty";
+        } catch (e) {
+          siteReason = "parse";
+          await bgLog("warn", "站内周边解析失败", { error: String(e) });
+        }
+      } else {
+        siteReason = internal.reason;
+      }
+    } else {
+      siteReason = "no-tab";
+    }
+
+    // 回退：Web 服务（只有点位）
+    const key = String(settings.amapKey || "").trim() || DEFAULT_AMAP_KEY;
     const url =
       "https://restapi.amap.com/v3/place/around?key=" + encodeURIComponent(key) +
       "&location=" + lng.toFixed(6) + "," + lat.toFixed(6) +
@@ -940,20 +1012,17 @@ const handlers = {
         const [plng, plat] = String(p.location || "").split(",").map(Number);
         if (!Number.isFinite(plng) || !Number.isFinite(plat)) return null;
         return {
-          id: p.id,
-          name: p.name,
-          address: p.address || "",
-          district: p.adname || null,
-          lng: plng,
-          lat: plat,
-          distance: Number(p.distance) || null,
-          typecode: p.typecode || null,
-          bbox: null,
+          id: p.id, name: p.name, address: p.address || "", district: p.adname || null,
+          lng: plng, lat: plat, distance: Number(p.distance) || null,
+          typecode: p.typecode || null, bbox: null,
         };
       })
       .filter(Boolean);
-    await bgLog("info", "周边小区（Web 服务）", { count: pois.length, range: r, requested });
-    return { ok: true, source: "amap-rest", range: r, requested, clamped: requested > r, count: pois.length, pois };
+    await bgLog("info", "周边小区（Web 服务）", { count: pois.length, range: r, why: siteReason });
+    return {
+      ok: true, source: "amap-rest", range: r, requested, clamped: requested > r,
+      count: pois.length, boxes: 0, siteReason, pois,
+    };
   },
 
   /**
