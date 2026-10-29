@@ -347,6 +347,11 @@ function normalizeCommunity(raw, defaults) {
       : null,
     footprintSource: raw.footprintSource || null,
     poiId: raw.poiId || null,
+    // 高德站内 shape_region：[minLng,minLat,maxLng,maxLat]（GCJ-02）
+    bbox:
+      Array.isArray(raw.bbox) && raw.bbox.length === 4 && raw.bbox.every((v) => Number.isFinite(Number(v)))
+        ? raw.bbox.map(Number)
+        : null,
     poiDistance: num(raw.poiDistance) ?? null,
     official,
     createdAt: raw.createdAt || Date.now(),
@@ -901,7 +906,8 @@ const handlers = {
    */
   async "poi.around"({ lng, lat, range = 1000, keywords = "小区", city = "610100", pagesize = 25 } = {}) {
     if (!Number.isFinite(lng) || !Number.isFinite(lat)) throw new Error("缺少圆心坐标");
-    const r = Math.max(100, Math.min(5000, Math.round(range)));
+    const requested = Math.round(Number(range) || 0);
+    const r = Math.max(100, Math.min(5000, requested));
     const url =
       "https://www.amap.com/service/poiInfo?query_type=RQBXY&pagesize=" + pagesize + "&pagenum=1" +
       "&qii=true&cluster_state=5&need_utd=true&utd_sceneid=1000&div=PC1000" +
@@ -918,7 +924,7 @@ const handlers = {
         const pois = list.map(normalizeSitePoi).filter(Boolean);
         if (pois.length) {
           await bgLog("info", "周边小区（站内）", { count: pois.length, range: r });
-          return { ok: true, source: "amap-site", range: r, count: pois.length, pois };
+          return { ok: true, source: "amap-site", range: r, requested, clamped: requested > r, count: pois.length, pois };
         }
       } catch (e) {
         await bgLog("warn", "站内周边解析失败", { error: String(e) });
@@ -953,7 +959,7 @@ const handlers = {
       };
     }).filter(Boolean);
     await bgLog("info", "周边小区（Web 服务）", { count: pois.length, range: r });
-    return { ok: true, source: "amap-rest", range: r, count: pois.length, pois };
+    return { ok: true, source: "amap-rest", range: r, requested, clamped: requested > r, count: pois.length, pois };
   },
 
   /** 人工判定：like / dislike / ignore / none（清除） */

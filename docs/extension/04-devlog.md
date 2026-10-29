@@ -692,3 +692,29 @@ post('data-changed') → ui.js reloadData() → 面板列表（按到目的地�
 |---|---|
 | `poi.around` | 周边小区（站内 RQBXY → Web 服务回退），返回 `{ok, source, range, count, pois[]}` |
 | `amapInternalFetch(url)` | 复用「真实 amap 标签页 + MAIN world XHR + 熔断」，`poi.polygon` 也改用它 |
+
+---
+
+## 20. v0.15.1 小区外接矩形上地图 + 半径口径说明
+
+**画外接矩形**：`poi.around` 的每条结果带 `shape_region`（`minLng,minLat,maxLng,maxLat`，GCJ-02），
+存进 `community.bbox`，由 `slippymap.setRects()` 画成半透明矩形 + 描边 + 名称；
+打开页面时 `restore` 一次，把库里已有矩形画回来。
+Web 服务回退路径没有 `shape_region`，所以那种情况下只有点位、没有矩形。
+
+**半径到底怎么用的**（这次把口径写清楚）：
+
+```
+圆心 = 所有目的地的中点（GCJ）
+半径 = max(目的地到圆心的距离) + settings.radiusKm × 1000
+```
+
+- 只有一个目的地时：半径 = `radiusKm × 1000`（即面板里填的 km）。
+- 多个目的地时：会额外加上最远目的地到中点的距离，圆能盖住全部目的地。
+- 传给接口：站内 `range=`、Web 服务 `radius=`，**同一个数**，单位米。
+- **上限 5 km**：`poi.around` 里 `Math.min(5000, …)`，超出会被截断；
+  返回值里带 `requested` / `clamped`，`hook-log` 会记录，便于发现被截断。
+- **条数上限 25**：站内 `pagesize=25`、Web 服务 `offset=25`，没有翻页；
+  半径很大时只返回最近的 25 个小区。
+- `city` 固定 `610100`（西安主城）。要查咸阳（610400）等地需要在设置里改；
+  目前没做成自动推导。

@@ -166,7 +166,13 @@
       post("hook-log", {
         level: "info",
         msg: "周边小区查询完成",
-        data: { source: res.source, count: pois.length, range: res.range || Math.round(circle.radius) },
+        data: {
+          source: res.source,
+          count: pois.length,
+          range: res.range || Math.round(circle.radius),
+          requested: res.requested,
+          clamped: res.clamped || false,
+        },
       });
 
       // 去重：库里已有的同名小区不再重复写入
@@ -191,6 +197,7 @@
               district: p.district || null,
               sources: ["poi"],
               poiId: p.id || null,
+              bbox: p.bbox || null,
               poiDistance: p.distance == null ? null : Math.round(p.distance),
             },
           });
@@ -199,7 +206,12 @@
           post("hook-log", { level: "warn", msg: "写入小区失败", data: { name, error: String(e) } });
         }
       }
-      post("hook-log", { level: "info", msg: "周边小区已写入面板", data: { added, total: pois.length } });
+      const rects = pois
+        .filter((p) => Array.isArray(p.bbox) && p.bbox.length === 4)
+        .map((p) => ({ name: p.name, bbox: p.bbox }));
+      if (rects.length) map.setRects(rects);
+      else map.setRects([]);
+      post("hook-log", { level: "info", msg: "周边小区已写入面板", data: { added, total: pois.length, rects: rects.length } });
       if (added) post("data-changed", { added });
       return { added, total: pois.length, source: res.source };
     } catch (e) {
@@ -246,6 +258,16 @@
 
   setTimeout(mountBasemapSwitch, 700);
   setTimeout(mountBasemapSwitch, 2000);
+  setTimeout(async () => {
+    try {
+      const boot = await rpc("boot");
+      const rects = (boot.communities || [])
+        .filter((c) => Array.isArray(c.bbox) && c.bbox.length === 4)
+        .map((c) => ({ name: c.name, bbox: c.bbox }));
+      if (rects.length) map.setRects(rects);
+    } catch { /* 忽略 */ }
+  }, 700);
+
   setTimeout(() => emitReady("boot"), 100);
   setTimeout(() => post("map-info", info()), 450);
   setTimeout(() => scan(), 900);

@@ -47,6 +47,7 @@
       this.maskTiles = [];
       this.maskImgs = new Map();
       this.roadCuts = [];        // 只用于切分阴影，不绘制
+      this.rects = [];           // 小区的外接矩形（shape_region）
       this.footprints = [];      // 已识别小区的多边形（覆盖阴影）
       this.maskHoles = [];       // 要被多边形覆盖掉的阴影区域
       this._maskCv = null;
@@ -238,6 +239,12 @@
       this.draw();
     }
 
+    /** 小区外接矩形：{name, bbox:[minLng,minLat,maxLng,maxLat]}（GCJ-02） */
+    setRects(list) {
+      this.rects = list || [];
+      this.draw();
+    }
+
     /** 这些区域从阴影掩膜里挖掉（被小区多边形替代） */
     setMaskHoles(list) {
       this.maskHoles = list || [];
@@ -301,6 +308,7 @@
       this._paintLines();
       this._paintPolygons();
       this._paintMaskTiles();
+      this._paintRects();
       this._paintCircle();
       this._paintMarkers();
     }
@@ -419,6 +427,40 @@
 
       this.ctx.drawImage(cv, 0, 0, this.w, this.h);
       this._paintFootprints();
+    }
+
+    /** 小区外接矩形（没拿到 mining_shape 时的显示方式） */
+    _paintRects() {
+      if (!this.rects.length) return;
+      const ctx = this.ctx;
+      ctx.save();
+      for (const r of this.rects) {
+        const b = r.bbox;
+        if (!b || b.length !== 4) continue;
+        const a = this.project(b[0], b[3]); // 左上（minLng,maxLat）
+        const c = this.project(b[2], b[1]); // 右下（maxLng,minLat）
+        const x = Math.min(a[0], c[0]);
+        const y = Math.min(a[1], c[1]);
+        const w = Math.abs(c[0] - a[0]);
+        const h = Math.abs(c[1] - a[1]);
+        if (w < 1 || h < 1) continue;
+        ctx.fillStyle = "rgba(46,95,138,.16)";
+        ctx.fillRect(x, y, w, h);
+        ctx.strokeStyle = "#2e5f8a";
+        ctx.lineWidth = 1.4;
+        ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+        if (r.name && w > 44) {
+          ctx.font = '600 11px "PingFang SC", system-ui, sans-serif';
+          ctx.textAlign = "center";
+          ctx.textBaseline = "bottom";
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = "rgba(255,255,255,.9)";
+          ctx.strokeText(r.name, x + w / 2, y - 2);
+          ctx.fillStyle = "#1a1815";
+          ctx.fillText(r.name, x + w / 2, y - 2);
+        }
+      }
+      ctx.restore();
     }
 
     /** 已识别小区：半透明填充 + 实线描边 + 名称 */
