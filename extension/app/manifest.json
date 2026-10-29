@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "西接通勤 · 通勤找房",
-  "version": "0.14.0",
-  "description": "自主卫星地图：阴影聚类 + 高德小区边界(polygon)覆盖 + POI 命名。",
+  "version": "0.15.0",
+  "description": "自主卫星地图：搜索圆 → 高德周边小区查询 → 面板列表（已移除阴影识别）。",
   "minimum_chrome_version": "111",
   "permissions": [
     "scripting",

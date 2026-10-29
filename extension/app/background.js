@@ -226,6 +226,84 @@ function parsePolygonString(v) {
   return pts.length >= 3 ? pts : null;
 }
 
+
+/** 在真实高德标签页的 MAIN world 发请求（站点 JS 会补 bx-ua/x-dc 指纹头） */
+async function amapInternalFetch(url) {
+  if (polyBlocked >= 2) return { ok: false, reason: "blocked-session" };
+  const tabs = await chrome.tabs.query({ url: "https://www.amap.com/*" });
+  let tab = tabs.find((t) => t.id != null);
+  if (!tab && polyTabId != null) {
+    try {
+      tab = await chrome.tabs.get(polyTabId);
+    } catch {
+      tab = null;
+    }
+  }
+  if (!tab) {
+    tab = await chrome.tabs.create({ url: "https://www.amap.com/", active: false });
+    polyTabId = tab.id;
+    await new Promise((r) => setTimeout(r, 3500));
+  }
+  clearTimeout(polyTabTimer);
+  polyTabTimer = setTimeout(() => {
+    if (polyTabId != null) chrome.tabs.remove(polyTabId).catch(() => {});
+    polyTabId = null;
+  }, 120000);
+  try {
+    const [out] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: "MAIN",
+      func: (u) =>
+        new Promise((resolve) => {
+          const x = new XMLHttpRequest();
+          x.open("GET", u, true);
+          x.timeout = 12000;
+          x.onload = () => resolve({ status: x.status, text: String(x.responseText || "") });
+          x.onerror = () => resolve({ status: 0, text: "" });
+          x.ontimeout = () => resolve({ status: -1, text: "" });
+          x.send();
+        }),
+      args: [url],
+    });
+    const r = (out && out.result) || {};
+    const text = String(r.text || "");
+    const blocked = !text || /rgv587|punish|FAIL_SYS_USER_VALIDATE/i.test(text);
+    if (blocked) {
+      polyBlocked += 1;
+      await bgLog("warn", "高德站内接口被拦", { status: r.status, head: text.slice(0, 100) });
+      return { ok: false, reason: "blocked", status: r.status };
+    }
+    return { ok: true, text };
+  } catch (e) {
+    await bgLog("warn", "高德站内接口失败", { error: String(e) });
+    return { ok: false, reason: "error", error: String(e) };
+  }
+}
+
+/** 站内 poi_list 的一条 → 统一结构（GCJ-02） */
+function normalizeSitePoi(p) {
+  if (!p || !p.name) return null;
+  const lng = Number(p.longitude);
+  const lat = Number(p.latitude);
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) return null;
+  let bbox = null;
+  if (typeof p.shape_region === "string") {
+    const n = p.shape_region.split(",").map(Number);
+    if (n.length === 4 && n.every(Number.isFinite)) bbox = n; // minLng,minLat,maxLng,maxLat
+  }
+  return {
+    id: p.id || null,
+    name: p.name,
+    address: p.address || "",
+    district: p.adname || null,
+    lng,
+    lat,
+    distance: Number(p.distance) || null,
+    typecode: p.typecode || null,
+    bbox,
+  };
+}
+
 function normalizeCommunity(raw, defaults) {
   if (!raw || typeof raw !== "object") return null;
   const d = defaults || {};
@@ -268,6 +346,8 @@ function normalizeCommunity(raw, defaults) {
           .filter((q) => q[0] != null && q[1] != null)
       : null,
     footprintSource: raw.footprintSource || null,
+    poiId: raw.poiId || null,
+    poiDistance: num(raw.poiDistance) ?? null,
     official,
     createdAt: raw.createdAt || Date.now(),
     updatedAt: Date.now(),
@@ -797,88 +877,83 @@ const handlers = {
    * 这个接口有反爬（bx-ua / x-dc 指纹头由站点 JS 生成），所以必须在**真实高德标签页**的
    * MAIN world 里发 XHR。拿不到（验证码/超时）返回 ok:false，调用方回退到阴影轮廓。
    */
-  async "poi.polygon"({ id, name, lng, lat, city = "610400" } = {}) {
+  async "poi.polygon"({ id, name } = {}) {
     if (!id) throw new Error("缺少 POI id");
-    if (polyBlocked >= 2) return { ok: false, reason: "blocked-session", id };
-    await new Promise((r) => setTimeout(r, 900)); // 别打太急，会触发验证码
-
-    const tabs = await chrome.tabs.query({ url: "https://www.amap.com/*" });
-    let tab = tabs.find((t) => t.id != null);
-    let created = false;
-    if (!tab) {
-      if (polyTabId != null) {
-        try {
-          tab = await chrome.tabs.get(polyTabId);
-        } catch {
-          tab = null;
-        }
-      }
-      if (!tab) {
-        tab = await chrome.tabs.create({ url: "https://www.amap.com/", active: false });
-        polyTabId = tab.id;
-        created = true;
-        await new Promise((r) => setTimeout(r, 3500));
-      }
-    }
-
+    const url = "https://amap-pc-ssr.amap.com/ssr/api/getPoiDetail?id=" + encodeURIComponent(id);
+    const r = await amapInternalFetch(url);
+    if (!r.ok) return { ok: false, reason: r.reason, id };
+    let json;
     try {
-      const url = "https://amap-pc-ssr.amap.com/ssr/api/getPoiDetail?id=" + encodeURIComponent(id);
-      const [out] = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        world: "MAIN",
-        func: (u) =>
-          new Promise((resolve) => {
-            const x = new XMLHttpRequest();
-            x.open("GET", u, true);
-            x.timeout = 12000;
-            x.onload = () => resolve({ status: x.status, text: String(x.responseText || "") });
-            x.onerror = () => resolve({ status: 0, text: "xhr-error" });
-            x.ontimeout = () => resolve({ status: -1, text: "timeout" });
-            x.send();
-          }),
-        args: [url],
-      });
-      const r = (out && out.result) || {};
-      const text = String(r.text || "");
-      const blocked = !text || (text.indexOf("mining_shape") < 0 && /rgv587|punish|FAIL_SYS_USER_VALIDATE/i.test(text));
-      if (blocked) {
-        polyBlocked += 1;
-        await bgLog("warn", "小区边界被拦", { id, status: r.status, head: text.slice(0, 120) });
-        return { ok: false, reason: "blocked", id };
-      }
-      let json;
+      json = JSON.parse(r.text);
+    } catch {
+      return { ok: false, reason: "not-json", id };
+    }
+    const spec = json && json.data && json.data.spec;
+    const pts = parsePolygonString(spec && spec.mining_shape && spec.mining_shape.shape);
+    if (!pts) return { ok: false, reason: "no-shape", id };
+    const base = (json.data && json.data.base) || {};
+    return { ok: true, id, name: base.name || name || null, address: base.address || null, pts, source: "amap-getPoiDetail" };
+  },
+
+  /**
+   * 周边小区：query_type=RQBXY（站内「周边」搜索）。
+   * 站内接口被拦时回退到 Web 服务 place/around，结果字段对齐。
+   */
+  async "poi.around"({ lng, lat, range = 1000, keywords = "小区", city = "610100", pagesize = 25 } = {}) {
+    if (!Number.isFinite(lng) || !Number.isFinite(lat)) throw new Error("缺少圆心坐标");
+    const r = Math.max(100, Math.min(5000, Math.round(range)));
+    const url =
+      "https://www.amap.com/service/poiInfo?query_type=RQBXY&pagesize=" + pagesize + "&pagenum=1" +
+      "&qii=true&cluster_state=5&need_utd=true&utd_sceneid=1000&div=PC1000" +
+      "&addr_poi_merge=true&is_classify=true&zoom=17.5" +
+      "&keywords=" + encodeURIComponent(keywords) +
+      "&longitude=" + lng.toFixed(6) + "&latitude=" + lat.toFixed(6) +
+      "&range=" + r + "&city=" + encodeURIComponent(city);
+
+    const internal = await amapInternalFetch(url);
+    if (internal.ok) {
       try {
-        json = JSON.parse(text);
-      } catch {
-        polyBlocked += 1;
-        return { ok: false, reason: "not-json", id };
-      }
-      const spec = json && json.data && json.data.spec;
-      const shape = spec && spec.mining_shape && spec.mining_shape.shape;
-      const pts = parsePolygonString(shape);
-      if (!pts) return { ok: false, reason: "no-shape", id, name: (json.data && json.data.base && json.data.base.name) || name };
-      const base = (json.data && json.data.base) || {};
-      await bgLog("info", "拿到小区边界", { id, name: base.name, points: pts.length });
-      return {
-        ok: true,
-        id,
-        name: base.name || name || null,
-        address: base.address || null,
-        pts,
-        source: "amap-getPoiDetail",
-      };
-    } catch (e) {
-      await bgLog("warn", "小区边界请求失败", { id, error: String(e) });
-      return { ok: false, reason: "error", error: String(e) };
-    } finally {
-      if (polyTabId != null) {
-        clearTimeout(polyTabTimer);
-        polyTabTimer = setTimeout(() => {
-          if (polyTabId != null) chrome.tabs.remove(polyTabId).catch(() => {});
-          polyTabId = null;
-        }, 120000);
+        const json = JSON.parse(internal.text);
+        const list = (json.data && json.data.poi_list) || [];
+        const pois = list.map(normalizeSitePoi).filter(Boolean);
+        if (pois.length) {
+          await bgLog("info", "周边小区（站内）", { count: pois.length, range: r });
+          return { ok: true, source: "amap-site", range: r, count: pois.length, pois };
+        }
+      } catch (e) {
+        await bgLog("warn", "站内周边解析失败", { error: String(e) });
       }
     }
+
+    // 回退：Web 服务
+    const s = normalizeSettings(await idb.get("settings", "main"));
+    const key = String(s.amapKey || "").trim() || DEFAULT_AMAP_KEY;
+    const restUrl =
+      "https://restapi.amap.com/v3/place/around?key=" + encodeURIComponent(key) +
+      "&location=" + lng.toFixed(6) + "," + lat.toFixed(6) +
+      "&radius=" + r + "&types=120302&offset=" + Math.max(1, Math.min(25, pagesize)) +
+      "&page=1&extensions=base&sortrule=distance";
+    const res = await fetch(restUrl);
+    if (!res.ok) throw new Error(`周边搜索 HTTP ${res.status}`);
+    const json = await res.json();
+    if (json.status !== "1") throw new Error(`周边搜索失败：${json.info || json.infocode}`);
+    const pois = (json.pois || []).map((p) => {
+      const [plng, plat] = String(p.location || "").split(",").map(Number);
+      if (!Number.isFinite(plng) || !Number.isFinite(plat)) return null;
+      return {
+        id: p.id,
+        name: p.name,
+        address: p.address || "",
+        district: p.adname || null,
+        lng: plng,
+        lat: plat,
+        distance: Number(p.distance) || null,
+        typecode: p.typecode || null,
+        bbox: null,
+      };
+    }).filter(Boolean);
+    await bgLog("info", "周边小区（Web 服务）", { count: pois.length, range: r });
+    return { ok: true, source: "amap-rest", range: r, count: pois.length, pois };
   },
 
   /** 人工判定：like / dislike / ignore / none（清除） */

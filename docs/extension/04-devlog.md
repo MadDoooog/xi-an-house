@@ -644,3 +644,51 @@ python3 -c "import zipfile;zipfile.ZipFile('dist/xian-commute-ext-v0.14.0.zip').
 - 扩展 ID 由**加载目录的绝对路径**决定，换目录会变，IndexedDB 也会跟着变。
 - 替换 `D:\xian-commute-ext` 后必须在 `chrome://extensions` 点刷新，否则旧的 service worker 继续跑，
   会出现「新旧两版同时生效」的假象。
+
+---
+
+## 19. v0.15.0 砍掉阴影识别，改成「圆 → 周边小区」
+
+**决定**：找一个片区里有什么小区，不需要先算阴影——阴影只是「这片可能有高层/连片小区」
+的代理，误差大且要标定阈值。直接用高德的「周边」搜索更准、更省事。
+
+**新链路**（`lib/hook-shim.js` 全部重写，shim-2）：
+
+```
+目的地 → 圆心（所有目的地中点）+ 半径（最远目的地 + radiusKm）
+      ↓
+poi.around  →  https://www.amap.com/service/poiInfo?query_type=RQBXY
+                &keywords=小区&longitude=&latitude=&range=&city=610100
+      ↓         站内接口被反爬拦时，回退 restapi.amap.com/v3/place/around?types=120302
+      ↓
+去重写入 community.put({name, lng, lat, district, sources:['poi'], poiId, poiDistance})
+      ↓
+post('data-changed') → ui.js reloadData() → 面板列表（按到目的地的通勤排序）
+```
+
+**站内接口返回结构**（用用户 cookie 实测）：
+
+```json
+{"data":{"poi_list":[{"name":"中南·上悦城","id":"B0FFJGYPL4","address":"…",
+  "longitude":"108.800100","latitude":"34.294052","distance":"160.01",
+  "typecode":"120302","shape_region":"108.797953,34.297848,108.802027,34.290433"}]}}
+```
+
+`shape_region` 只是外接矩形（minLng,minLat,maxLng,maxLat），**不是小区边界**；
+真边界仍要 `getPoiDetail` 的 `mining_shape`（`poi.polygon` 保留，但不再自动批量调）。
+
+**实测**（安泰路 108.800142,34.292615，半径 1 km）：
+站内被反爬拦 → 回退 Web 服务，返回 14 个小区并写入面板
+（中南·上悦城四期 146 m、二期 150 m、三期 151 m、中南·上悦城 159 m、沣华熙郡 383 m …）。
+
+**同时删掉的东西**：
+- `map.html` 不再加载 `lib/shadow-clusters.js`；页面不再画掩膜/路网剪切/小区轮廓。
+- 自动扫描不再由 `community.put` 触发（只认 `settings.set`），避免自己写自己递归。
+- `lib/shadow.js`、`lib/shadow-clusters.js`、`background.scan.*` **保留但不再被地图页使用**，
+  作为参考实现（注入版「发现」页仍在用 `scan.plan/scan.tile`）。
+
+**新增/改动 RPC**：
+| RPC | 说明 |
+|---|---|
+| `poi.around` | 周边小区（站内 RQBXY → Web 服务回退），返回 `{ok, source, range, count, pois[]}` |
+| `amapInternalFetch(url)` | 复用「真实 amap 标签页 + MAIN world XHR + 熔断」，`poi.polygon` 也改用它 |
