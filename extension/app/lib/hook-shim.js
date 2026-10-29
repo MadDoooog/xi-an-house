@@ -249,6 +249,8 @@
         );
         if (allowTab) {
           enrichBoxes(circle, res.range || Math.round(circle.radius), byName, true).catch(() => {});
+        } else {
+          post("hook-log", { level: "info", msg: "跳过外接矩形：设置里关掉了后台标签页", data: {} });
         }
       }
       return { added, total: pois.length, source: res.source };

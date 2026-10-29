@@ -1217,5 +1217,6 @@ chrome.runtime.onStartup.addListener(() => {
 
 // service worker 每次唤醒都确保有默认设置（幂等）
 ensureSeeded()
+  .then(() => migrateBoxTab())
   .then(() => bgLog("debug", "service worker 就绪"))
   .catch((e) => console.error("[XAT][bg] 初始化失败", e));
