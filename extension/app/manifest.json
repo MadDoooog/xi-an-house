@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "西接通勤 · 通勤找房",
-  "version": "0.15.4",
+  "version": "0.15.5",
   "description": "自主卫星地图：搜索圆 → 高德周边小区查询 → 面板列表（已移除阴影识别）。",
   "minimum_chrome_version": "111",
   "permissions": [

@@ -342,6 +342,7 @@
             直接写进结果列表。半径取自条件里的搜索范围；有多个目的地时圆心取中点。
           </p>
           <button class="btn btn--primary btn--xs" data-act="scan-roi">查询周边小区</button>
+          <button class="btn btn--xs" data-act="diag-site" style="margin-left:6px">诊断站内接口</button>
           <div id="xat-scan-out"></div>
           <p class="hint">结果带「POI 发现」标记；价格/面积需要自己补。</p>
         </div>
@@ -797,6 +798,29 @@
 
   function freezeMap(on) {
     window.postMessage({ __xat: "ui", type: "freeze", on: !!on }, "*");
+  }
+
+  /** 诊断：直接打一次站内接口，把结果打到发现页 */
+  async function diagSite() {
+    const out = $("#xat-scan-out");
+    const roi = state.roi;
+    if (!roi) { toast("先设目的地，才有圆心"); return; }
+    if (out) out.innerHTML = `<p class="hint">诊断中…（会开/复用一个高德标签页，最多 15 秒）</p>`;
+    try {
+      const r = await rpc("poi.diag", {
+        lng: roi.center[0],
+        lat: roi.center[1],
+        range: Math.round(roi.radius),
+      });
+      const lines = r && r.ok
+        ? [`站内接口 OK：${r.pois} 条，其中带矩形 ${r.withBox} 条`]
+        : [`站内接口失败：${(r && r.reason) || "unknown"}（HTTP ${(r && r.status) || "?"}）`];
+      if (r && r.head) lines.push(`响应开头：${esc(r.head)}`);
+      if (out) out.innerHTML = lines.map((t) => `<p class="hint">${t}</p>`).join("");
+      log.info("站内接口诊断", r);
+    } catch (e) {
+      if (out) out.innerHTML = `<p class="hint">诊断失败：${esc(e.message || e)}</p>`;
+    }
   }
 
   async function startScan() {
@@ -2038,6 +2062,7 @@
     }
     if (a === "new-community") openCommunityForm(null);
     if (a === "scan-roi") startScan();
+    if (a === "diag-site") diagSite();
     if (a === "sat-verdict") setVerdict(act.dataset.key, act.dataset.v, act.dataset.cur || "");
     if (a === "adopt-tile") adoptTile(act.dataset.key);
     if (a === "edit-community") openCommunityForm(state.selected);

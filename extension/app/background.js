@@ -299,7 +299,7 @@ async function amapInternalFetch(url, opts) {
       polyBlocked += 1;
       polyCooldownUntil = Date.now() + 10 * 60 * 1000;
       await bgLog("warn", "高德站内接口被拦", { status: r.status, head: text.slice(0, 100) });
-      return { ok: false, reason: "blocked", status: r.status };
+      return { ok: false, reason: "blocked", status: r.status, head: text.slice(0, 160) };
     }
     clearTimeout(polyTabTimer);
     polyTabTimer = setTimeout(() => {
@@ -1025,6 +1025,32 @@ const handlers = {
     };
   },
 
+  /** 诊断：强制走一次站内接口，把结果/原因/响应头返回给面板 */
+  async "poi.diag"({ lng, lat, range = 1000, city = "610100" } = {}) {
+    const r = Math.max(100, Math.min(5000, Math.round(Number(range) || 1000)));
+    const url =
+      "https://www.amap.com/service/poiInfo?query_type=RQBXY&pagesize=25&pagenum=1" +
+      "&qii=true&cluster_state=5&need_utd=true&utd_sceneid=1000&div=PC1000" +
+      "&addr_poi_merge=true&is_classify=true&zoom=17.5&keywords=%E5%B0%8F%E5%8C%BA" +
+      "&longitude=" + lng.toFixed(6) + "&latitude=" + lat.toFixed(6) +
+      "&range=" + r + "&city=" + encodeURIComponent(city);
+    const before = polyCooldownUntil;
+    polyCooldownUntil = 0;
+    polyBlocked = 0;
+    const r2 = await amapInternalFetch(url, { allowCreateTab: true });
+    polyCooldownUntil = before;
+    if (!r2.ok) return { ok: false, reason: r2.reason, status: r2.status, head: r2.head || "" };
+    let n = 0;
+    let withBox = 0;
+    try {
+      const json = JSON.parse(r2.text);
+      const list = (json.data && json.data.poi_list) || [];
+      n = list.length;
+      withBox = list.filter((p) => normalizeSitePoi(p) && normalizeSitePoi(p).bbox).length;
+    } catch { /* ignore */ }
+    return { ok: true, pois: n, withBox, head: r2.text.slice(0, 160) };
+  },
+
   /**
    * 外接矩形：站内 RQBXY 一次能带回整页的 shape_region，按 id 对齐。
    * 需要真实高德标签页（反爬头）；失败就返回 ok:false，调用方不画矩形。
@@ -1040,7 +1066,7 @@ const handlers = {
       "&longitude=" + lng.toFixed(6) + "&latitude=" + lat.toFixed(6) +
       "&range=" + r + "&city=" + encodeURIComponent(city);
     const internal = await amapInternalFetch(url, { allowCreateTab: !!allowTab });
-    if (!internal.ok) return { ok: false, reason: internal.reason };
+    if (!internal.ok) return { ok: false, reason: internal.reason, head: internal.head };
     try {
       const json = JSON.parse(internal.text);
       const list = (json.data && json.data.poi_list) || [];
