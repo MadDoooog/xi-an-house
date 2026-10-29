@@ -337,17 +337,20 @@
 
       <div class="tabpane" data-tabpane="discover" hidden>
         <div class="scan">
-          <p class="hint" style="margin-top:10px">把搜索范围（大圆）里的卫星图抓下来，<b>先二值化，再挑出片状的阴影块</b>（够大、够成型），
-            碎影和细线不算。机器结果只做参考，看图后点「像小区 / 不像」。</p>
-          <button class="btn btn--primary btn--xs" data-act="scan-roi">扫描大圆影像</button>
+          <p class="hint" style="margin-top:10px">
+            以<b>搜索圆的圆心</b>调高德「周边小区」查询，把圆内的小区（名称、地址、距离）
+            直接写进结果列表。半径取自条件里的搜索范围；有多个目的地时圆心取中点。
+          </p>
+          <button class="btn btn--primary btn--xs" data-act="scan-roi">查询周边小区</button>
           <div id="xat-scan-out"></div>
+          <p class="hint">结果带「POI 发现」标记；价格/面积需要自己补。</p>
         </div>
       </div>
 
       <div class="tabpane" data-tabpane="gap" hidden>
         <div class="placeholder">
-          <div class="placeholder__t">影像补漏已砍</div>
-          <div class="placeholder__d">主流程不再自带底图，影像规则扫描失去瓦片来源，本期不做。</div>
+          <div class="placeholder__t">这个标签页暂未使用</div>
+          <div class="placeholder__d">小区来源现在是高德「周边小区」查询，不再做影像推断。</div>
         </div>
       </div>
     </section>
@@ -674,13 +677,6 @@
     const built = Number(r.buildYear) > 0 ? `${r.buildYear} 年 · 房龄 ${new Date().getFullYear() - r.buildYear} 年` : null;
 
     $("#xat-dbody").innerHTML = `
-      <div class="sat" id="xat-dsat"><div class="sat__ph">卫星影像加载中…</div></div>
-
-      <div class="cblock">
-        <div class="cblock__title">影像粗判（机器参考，需人工核对）</div>
-        <div id="xat-dsat-metrics"><p class="hint" style="margin-top:0">等影像…</p></div>
-      </div>
-
       <div class="cblock">
         <div class="cblock__title">通勤（${state.dests.length} 个目的地 · 估算）</div>
         ${commute || `<p class="hint" style="margin-top:0">还没有目的地，先去「筛选条件」里加一个。</p>`}
@@ -718,7 +714,6 @@
     `;
 
     $$("[data-goto]").forEach((b) => b.addEventListener("click", () => gotoAmap(Number(b.dataset.goto))));
-    loadCommunitySat(r);
   }
 
   /* ---------------- 卫星影像：详情图 + 大圆扫描 ---------------- */
@@ -997,7 +992,7 @@
     if (!out) return;
     const s = state.scan;
     if (!s) {
-      out.innerHTML = `<p class="hint">还没扫描。点上面的按钮会抓 20–25 张瓦片并分析；首次约 10–20 秒，之后走本机缓存。</p>`;
+      out.innerHTML = `<p class="hint">还没查询。点上面的按钮会按圆心（条件里的搜索范围）拉一次周边小区，通常 1–2 秒。</p>`;
       return;
     }
     if (s.incremental) {

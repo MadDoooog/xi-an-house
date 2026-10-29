@@ -449,15 +449,16 @@
         ctx.strokeStyle = "#2e5f8a";
         ctx.lineWidth = 1.4;
         ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
-        if (r.name && w > 44) {
-          ctx.font = '600 11px "PingFang SC", system-ui, sans-serif';
+        if (r.name && w > 34 && h > 16) {
+          // 名字画在矩形正中
+          ctx.font = '600 12px "PingFang SC", system-ui, sans-serif';
           ctx.textAlign = "center";
-          ctx.textBaseline = "bottom";
-          ctx.lineWidth = 3;
-          ctx.strokeStyle = "rgba(255,255,255,.9)";
-          ctx.strokeText(r.name, x + w / 2, y - 2);
+          ctx.textBaseline = "middle";
+          ctx.lineWidth = 3.5;
+          ctx.strokeStyle = "rgba(255,255,255,.92)";
+          ctx.strokeText(r.name, x + w / 2, y + h / 2);
           ctx.fillStyle = "#1a1815";
-          ctx.fillText(r.name, x + w / 2, y - 2);
+          ctx.fillText(r.name, x + w / 2, y + h / 2);
         }
       }
       ctx.restore();
