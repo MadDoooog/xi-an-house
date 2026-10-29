@@ -735,3 +735,31 @@ Web 服务回退路径没有 `shape_region`，所以那种情况下只有点位�
 
 `loadCommunitySat` / `renderSatInto` 变成死代码（`$("#xat-dsat")` 为空会直接返回），保留未删。
 `imagery.community` RPC 仍在，只是地图页不再调用。
+
+---
+
+## 22. v0.15.3 查询提速 + 不再乱开标签页
+
+**用户反馈的两个问题**：
+
+1. 打开插件还是上次的目的地/小区、小区还是点状；
+2. 点保存会弹出一个新标签页停在 `amap.com/ssr/search`，没反应。
+
+**原因与改法**：
+
+| 现象 | 原因 | 改法 |
+|---|---|---|
+| 保存后「没反应」 | `poi.around` 先走站内接口（要开标签页、等 3.5 s、还可能被反爬拦），列表要等这条路走完才出现 | **拆成两步**：`poi.around` 只走 Web 服务（~1 s 出列表）；站内接口挪到 `poi.aroundBoxes`，**在列表出来之后**后台补矩形 |
+| 新标签页乱弹 | `amapInternalFetch` 找不到高德页就自己 `tabs.create` | 默认 **不建标签页**（`allowTab=false`）；只有用户自己开着 amap.com，或设置里勾了「允许后台开标签页」才建 |
+| 小区还是点状 | 只有站内接口返回 `shape_region`；Web 服务没有 | 矩形改为**后补**：补到就画、补不到就只有点位 |
+| 小区重复/不更新 | 同名小区被 `seenNames` 直接跳过，永远补不上 bbox | 改成 **同名走 `community.patch`**（补 poiId/距离/bbox），不再跳过 |
+
+**新增 RPC**：
+- `poi.around` — 只查 Web 服务，返回 `{source:'amap-rest', range, requested, clamped, pois[]}`
+- `poi.aroundBoxes` — 站内 RQBXY，返回 `{ok, boxes:[{id,name,bbox}]}`；失败 `{ok:false, reason:'no-tab'|'blocked'}`
+- `community.patch({id, patch})` — 局部更新一条小区，不覆盖其它字段
+
+**设置页**新增勾选项「允许后台开一个高德标签页，用来取小区外接矩形」（`settings.amapTabForBoxes`，默认关）。
+
+**行为说明**：目的地上次留下的、小区列表上次留下的都是 IndexedDB 持久化（刻意设计）；
+打开页面会自动按圆心查一次，已有小区走更新而不是新增。想要矩形，请开着一个 amap.com 标签页。

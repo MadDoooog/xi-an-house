@@ -260,6 +260,8 @@ setInterval(() => {
       const d = await rpc("boot");
       const key = (d.settings && d.settings.amapKey) || "";
       input.value = key;
+      const cb = document.getElementById("amap-tab-boxes");
+      if (cb) cb.checked = !!(d.settings && d.settings.amapTabForBoxes);
       stateEl.textContent = key
         ? `已配置（${key.slice(0, 6)}…${key.slice(-4)}）`
         : "未配置。没有 key 时阴影仍会扫描，但不会反查小区名。";
@@ -267,6 +269,14 @@ setInterval(() => {
       stateEl.textContent = "读取失败：" + e.message;
     }
   };
+  document.getElementById("amap-tab-boxes")?.addEventListener("change", async (e) => {
+    try {
+      await rpc("settings.set", { patch: { amapTabForBoxes: !!e.target.checked } });
+      toast(e.target.checked ? "已允许后台标签页" : "已关闭后台标签页");
+    } catch (err) {
+      stateEl.textContent = "保存失败：" + err.message;
+    }
+  });
   btn.addEventListener("click", async () => {
     const key = input.value.trim();
     try {

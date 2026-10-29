@@ -116,6 +116,8 @@ const DEFAULT_AMAP_KEY = "b58587dccf8efd1021dee8dcdbc43845";
 const DEFAULT_SETTINGS = {
   key: "main",
   amapKey: DEFAULT_AMAP_KEY,
+  // 是否允许后台开一个高德标签页去取小区外接矩形（默认不打扰）
+  amapTabForBoxes: false,
   // 默认空：目的地由你右键复制地址后粘贴添加
   destinations: [],
   destinationCount: 0,
@@ -228,7 +230,8 @@ function parsePolygonString(v) {
 
 
 /** 在真实高德标签页的 MAIN world 发请求（站点 JS 会补 bx-ua/x-dc 指纹头） */
-async function amapInternalFetch(url) {
+async function amapInternalFetch(url, opts) {
+  const allowCreateTab = !!(opts && opts.allowCreateTab);
   if (polyBlocked >= 2) return { ok: false, reason: "blocked-session" };
   const tabs = await chrome.tabs.query({ url: "https://www.amap.com/*" });
   let tab = tabs.find((t) => t.id != null);
@@ -240,6 +243,9 @@ async function amapInternalFetch(url) {
     }
   }
   if (!tab) {
+    // 默认不开新标签页（会在标签栏里弹出来、还挡着用户）。
+    // 需要「外接矩形」时，请自己开着一个 amap.com 页面，或打开设置里的开关。
+    if (!allowCreateTab) return { ok: false, reason: "no-tab" };
     tab = await chrome.tabs.create({ url: "https://www.amap.com/", active: false });
     polyTabId = tab.id;
     await new Promise((r) => setTimeout(r, 3500));
@@ -248,7 +254,7 @@ async function amapInternalFetch(url) {
   polyTabTimer = setTimeout(() => {
     if (polyTabId != null) chrome.tabs.remove(polyTabId).catch(() => {});
     polyTabId = null;
-  }, 120000);
+  }, 15000);
   try {
     const [out] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
@@ -584,6 +590,16 @@ const handlers = {
     return next;
   },
 
+  /** 局部更新一条小区（补 bbox / poiId 等），不动其它字段 */
+  async "community.patch"({ id, patch } = {}) {
+    if (!id) throw new Error("缺少小区 id");
+    const row = await idb.get("communities", String(id));
+    if (!row) throw new Error("小区不存在");
+    const merged = normalizeCommunity(Object.assign({}, row, patch || {}, { id: row.id }));
+    await idb.put("communities", merged);
+    return merged;
+  },
+
   async "community.put"({ community }) {
     const row = normalizeCommunity(community, { sources: ["manual"] });
     if (!row) throw new Error("小区缺名称或坐标");
@@ -901,65 +917,76 @@ const handlers = {
   },
 
   /**
-   * 周边小区：query_type=RQBXY（站内「周边」搜索）。
-   * 站内接口被拦时回退到 Web 服务 place/around，结果字段对齐。
+   * 周边小区：Web 服务 place/around（快、稳、不需登录态）。
+   * 站内接口只用来「补外接矩形」，见 poi.aroundBoxes。
    */
   async "poi.around"({ lng, lat, range = 1000, keywords = "小区", city = "610100", pagesize = 25 } = {}) {
     if (!Number.isFinite(lng) || !Number.isFinite(lat)) throw new Error("缺少圆心坐标");
     const requested = Math.round(Number(range) || 0);
     const r = Math.max(100, Math.min(5000, requested));
+    const s = normalizeSettings(await idb.get("settings", "main"));
+    const key = String(s.amapKey || "").trim() || DEFAULT_AMAP_KEY;
     const url =
-      "https://www.amap.com/service/poiInfo?query_type=RQBXY&pagesize=" + pagesize + "&pagenum=1" +
+      "https://restapi.amap.com/v3/place/around?key=" + encodeURIComponent(key) +
+      "&location=" + lng.toFixed(6) + "," + lat.toFixed(6) +
+      "&radius=" + r + "&types=120302&offset=" + Math.max(1, Math.min(25, pagesize)) +
+      "&page=1&extensions=base&sortrule=distance";
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`周边搜索 HTTP ${res.status}`);
+    const json = await res.json();
+    if (json.status !== "1") throw new Error(`周边搜索失败：${json.info || json.infocode}`);
+    const pois = (json.pois || [])
+      .map((p) => {
+        const [plng, plat] = String(p.location || "").split(",").map(Number);
+        if (!Number.isFinite(plng) || !Number.isFinite(plat)) return null;
+        return {
+          id: p.id,
+          name: p.name,
+          address: p.address || "",
+          district: p.adname || null,
+          lng: plng,
+          lat: plat,
+          distance: Number(p.distance) || null,
+          typecode: p.typecode || null,
+          bbox: null,
+        };
+      })
+      .filter(Boolean);
+    await bgLog("info", "周边小区（Web 服务）", { count: pois.length, range: r, requested });
+    return { ok: true, source: "amap-rest", range: r, requested, clamped: requested > r, count: pois.length, pois };
+  },
+
+  /**
+   * 外接矩形：站内 RQBXY 一次能带回整页的 shape_region，按 id 对齐。
+   * 需要真实高德标签页（反爬头）；失败就返回 ok:false，调用方不画矩形。
+   */
+  async "poi.aroundBoxes"({ lng, lat, range = 1000, keywords = "小区", city = "610100", allowTab = false } = {}) {
+    if (!Number.isFinite(lng) || !Number.isFinite(lat)) throw new Error("缺少圆心坐标");
+    const r = Math.max(100, Math.min(5000, Math.round(Number(range) || 0)));
+    const url =
+      "https://www.amap.com/service/poiInfo?query_type=RQBXY&pagesize=25&pagenum=1" +
       "&qii=true&cluster_state=5&need_utd=true&utd_sceneid=1000&div=PC1000" +
       "&addr_poi_merge=true&is_classify=true&zoom=17.5" +
       "&keywords=" + encodeURIComponent(keywords) +
       "&longitude=" + lng.toFixed(6) + "&latitude=" + lat.toFixed(6) +
       "&range=" + r + "&city=" + encodeURIComponent(city);
-
-    const internal = await amapInternalFetch(url);
-    if (internal.ok) {
-      try {
-        const json = JSON.parse(internal.text);
-        const list = (json.data && json.data.poi_list) || [];
-        const pois = list.map(normalizeSitePoi).filter(Boolean);
-        if (pois.length) {
-          await bgLog("info", "周边小区（站内）", { count: pois.length, range: r });
-          return { ok: true, source: "amap-site", range: r, requested, clamped: requested > r, count: pois.length, pois };
-        }
-      } catch (e) {
-        await bgLog("warn", "站内周边解析失败", { error: String(e) });
-      }
+    const internal = await amapInternalFetch(url, { allowCreateTab: !!allowTab });
+    if (!internal.ok) return { ok: false, reason: internal.reason };
+    try {
+      const json = JSON.parse(internal.text);
+      const list = (json.data && json.data.poi_list) || [];
+      const boxes = list
+        .map((p) => {
+          const poi = normalizeSitePoi(p);
+          return poi && poi.bbox ? { id: poi.id, name: poi.name, bbox: poi.bbox } : null;
+        })
+        .filter(Boolean);
+      await bgLog("info", "周边小区外接矩形", { boxes: boxes.length });
+      return { ok: true, source: "amap-site", boxes };
+    } catch (e) {
+      await bgLog("warn", "外接矩形解析失败", { error: String(e) });
+      return { ok: false, reason: "parse" };
     }
-
-    // 回退：Web 服务
-    const s = normalizeSettings(await idb.get("settings", "main"));
-    const key = String(s.amapKey || "").trim() || DEFAULT_AMAP_KEY;
-    const restUrl =
-      "https://restapi.amap.com/v3/place/around?key=" + encodeURIComponent(key) +
-      "&location=" + lng.toFixed(6) + "," + lat.toFixed(6) +
-      "&radius=" + r + "&types=120302&offset=" + Math.max(1, Math.min(25, pagesize)) +
-      "&page=1&extensions=base&sortrule=distance";
-    const res = await fetch(restUrl);
-    if (!res.ok) throw new Error(`周边搜索 HTTP ${res.status}`);
-    const json = await res.json();
-    if (json.status !== "1") throw new Error(`周边搜索失败：${json.info || json.infocode}`);
-    const pois = (json.pois || []).map((p) => {
-      const [plng, plat] = String(p.location || "").split(",").map(Number);
-      if (!Number.isFinite(plng) || !Number.isFinite(plat)) return null;
-      return {
-        id: p.id,
-        name: p.name,
-        address: p.address || "",
-        district: p.adname || null,
-        lng: plng,
-        lat: plat,
-        distance: Number(p.distance) || null,
-        typecode: p.typecode || null,
-        bbox: null,
-      };
-    }).filter(Boolean);
-    await bgLog("info", "周边小区（Web 服务）", { count: pois.length, range: r });
-    return { ok: true, source: "amap-rest", range: r, requested, clamped: requested > r, count: pois.length, pois };
   },
 
   /** 人工判定：like / dislike / ignore / none（清除） */

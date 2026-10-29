@@ -175,50 +175,103 @@
         },
       });
 
-      // 去重：库里已有的同名小区不再重复写入
-      const seen = new Set();
+      // 库里已有的同名小区：更新（补 poiId/距离/矩形），不再跳过
+      const byName = new Map();
       try {
         const boot = await rpc("boot");
-        for (const c of boot.communities || []) seen.add(String(c.name || ""));
+        for (const c of boot.communities || []) byName.set(String(c.name || ""), c);
       } catch { /* 忽略 */ }
 
       let added = 0;
+      let updated = 0;
       for (const p of pois) {
         const name = String(p.name || "").trim();
-        if (!name || seen.has(name)) continue;
-        seen.add(name);
+        if (!name) continue;
         const wgs = XAT_IMAGERY.gcj02ToWgs84(p.lng, p.lat);
+        const existing = byName.get(name);
         try {
-          await rpc("community.put", {
-            community: {
-              name,
-              lng: wgs[0],
-              lat: wgs[1],
-              district: p.district || null,
-              sources: ["poi"],
-              poiId: p.id || null,
-              bbox: p.bbox || null,
-              poiDistance: p.distance == null ? null : Math.round(p.distance),
-            },
-          });
-          added += 1;
+          if (existing) {
+            await rpc("community.patch", {
+              id: existing.id,
+              patch: {
+                poiId: p.id || existing.poiId || null,
+                poiDistance: p.distance == null ? existing.poiDistance ?? null : Math.round(p.distance),
+                bbox: p.bbox || existing.bbox || null,
+              },
+            });
+            updated += 1;
+          } else {
+            const saved = await rpc("community.put", {
+              community: {
+                name,
+                lng: wgs[0],
+                lat: wgs[1],
+                district: p.district || null,
+                sources: ["poi"],
+                poiId: p.id || null,
+                poiDistance: p.distance == null ? null : Math.round(p.distance),
+                bbox: p.bbox || null,
+              },
+            });
+            if (saved && saved.id) byName.set(name, saved);
+            added += 1;
+          }
         } catch (e) {
           post("hook-log", { level: "warn", msg: "写入小区失败", data: { name, error: String(e) } });
         }
       }
-      const rects = pois
-        .filter((p) => Array.isArray(p.bbox) && p.bbox.length === 4)
-        .map((p) => ({ name: p.name, bbox: p.bbox }));
-      if (rects.length) map.setRects(rects);
-      else map.setRects([]);
-      post("hook-log", { level: "info", msg: "周边小区已写入面板", data: { added, total: pois.length, rects: rects.length } });
-      if (added) post("data-changed", { added });
+
+      // 先画库里已有的矩形（Web 服务没有 shape_region）
+      let rects = [...byName.values()]
+        .filter((c) => Array.isArray(c.bbox) && c.bbox.length === 4)
+        .map((c) => ({ name: c.name, bbox: c.bbox }));
+      map.setRects(rects);
+
+      post("hook-log", { level: "info", msg: "周边小区已写入面板", data: { added, updated, total: pois.length, rects: rects.length } });
+      if (added || updated) post("data-changed", { added, updated });
+
+      // 后台补矩形：站内接口一次带回整页 shape_region，失败就算了
+      enrichBoxes(circle, res.range || Math.round(circle.radius), byName, settings && settings.amapTabForBoxes).catch(() => {});
       return { added, total: pois.length, source: res.source };
     } catch (e) {
       post("hook-log", { level: "warn", msg: "周边小区查询失败", data: { error: String(e) } });
       return null;
     } finally {
       scanning = false;
+    }
+  }
+
+  /** 站内接口补外接矩形（慢、可能被反爬拦，失败静默） */
+  async function enrichBoxes(circle, range, byName, allowTab) {
+    let ok = false;
+    try {
+      const boxes = await rpc("poi.aroundBoxes", {
+        lng: circle.center[0],
+        lat: circle.center[1],
+        range,
+        keywords: "小区",
+        // 默认不主动开标签页：只有用户自己开着 amap.com，或设置里允许时才补矩形
+        allowTab: !!allowTab,
+      });
+      ok = !!(boxes && boxes.ok && Array.isArray(boxes.boxes) && boxes.boxes.length);
+      if (ok) {
+        for (const b of boxes.boxes) {
+          const c = byName.get(String(b.name || ""));
+          if (!c) continue;
+          c.bbox = b.bbox;
+          if (c.id) {
+            await rpc("community.patch", { id: c.id, patch: { bbox: b.bbox, poiId: b.id || c.poiId || null } }).catch(() => {});
+          }
+        }
+        const rects = [...byName.values()]
+          .filter((c) => Array.isArray(c.bbox) && c.bbox.length === 4)
+          .map((c) => ({ name: c.name, bbox: c.bbox }));
+        map.setRects(rects);
+        post("data-changed", { rects: rects.length });
+      }
+      post("hook-log", { level: "info", msg: "外接矩形补充", data: { ok, boxes: ok ? boxes.boxes.length : 0 } });
+    } catch (e) {
+      post("hook-log", { level: "warn", msg: "外接矩形补充失败", data: { error: String(e) } });
     }
   }
 

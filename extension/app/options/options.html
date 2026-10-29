@@ -122,7 +122,11 @@
       <input type="text" id="amap-key" placeholder="粘贴高德「Web 服务」key" style="flex:1" />
       <button class="btn btn--xs" id="btn-amap-key">保存</button>
     </div>
-    <p class="hint" id="amap-key-state">未配置。没有 key 时阴影仍会扫描，但不会反查小区名。</p>
+    <p class="hint" id="amap-key-state">—</p>
+    <div class="row" style="margin-top:6px">
+      <label class="check"><input type="checkbox" id="amap-tab-boxes" /> 允许后台开一个高德标签页，用来取小区外接矩形</label>
+    </div>
+    <p class="hint">不开也能用：只要你自己开着一个 amap.com 页面，矩形就会补上；否则列表里只有点位。</p>
     <p class="hint">
       高德控制台 → 应用管理 → 新建应用 → 添加 Key → 服务平台选「Web服务」。这个 key 只存本机 IndexedDB。
     </p>
